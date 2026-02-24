@@ -1,9 +1,7 @@
 # app.py
 import re
 import unicodedata
-import json
-import datetime as dt
-
+from datetime import date, datetime
 import numpy as np
 import pandas as pd
 import streamlit as st
@@ -11,46 +9,40 @@ import plotly.express as px
 import plotly.graph_objects as go
 from dataclasses import dataclass
 from typing import Optional, List, Tuple, Dict
+import json
 
 
 # =========================
-# ✅ JSON helpers (FIX: date not JSON serializable)
+# ✅ JSON helpers (para evitar: date / Timestamp / numpy not JSON serializable)
 # =========================
 def _json_default(o):
-    """
-    Hace serializable para json.dumps:
-    - datetime/date/pandas Timestamp/Period
-    - numpy scalars/arrays
-    - pandas NA
-    """
-    # pandas / datetime
-    if isinstance(o, (dt.datetime, dt.date)):
+    # fechas/tiempos
+    if isinstance(o, (datetime, pd.Timestamp)):
         return o.isoformat()
-    if isinstance(o, pd.Timestamp):
+    if isinstance(o, date):
         return o.isoformat()
+
+    # numpy scalars/arrays
+    if isinstance(o, np.integer):
+        return int(o)
+    if isinstance(o, np.floating):
+        return float(o)
+    if isinstance(o, np.ndarray):
+        return o.tolist()
+
+    # pandas Period/Categorical/etc
     if isinstance(o, pd.Period):
         return str(o)
 
-    # numpy
-    if isinstance(o, (np.integer,)):
-        return int(o)
-    if isinstance(o, (np.floating,)):
-        v = float(o)
-        return None if not np.isfinite(v) else v
-    if isinstance(o, (np.bool_,)):
-        return bool(o)
-    if isinstance(o, (np.ndarray,)):
-        return o.tolist()
-
-    # pandas NA
-    try:
-        if pd.isna(o):
-            return None
-    except Exception:
-        pass
-
-    # fallback
+    # fallback seguro
     return str(o)
+
+
+def _iso_date(x):
+    try:
+        return x.isoformat()
+    except Exception:
+        return str(x)
 
 
 def build_dashboard_html(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame], initial_filters: dict) -> bytes:
@@ -106,7 +98,8 @@ def build_dashboard_html(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFra
 
         # asegurar columnas esperadas
         d_need = [
-            "Ruta", "Sede", "Jornada", "Tipo de bus", "Km", "Tiempo (minutos)", "Capacidad", "# Días", "Precio Q (Diario)",
+            "Ruta", "Sede", "Jornada", "Tipo de bus",
+            "Km", "Tiempo (minutos)", "Capacidad", "# Días", "Precio Q (Diario)",
             "ruta_norm", "sede_norm", "jornada_norm"
         ]
         for c in d_need:
@@ -151,9 +144,8 @@ def build_dashboard_html(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFra
         "weekday_order": ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"],
     }
 
-    # ✅ FIX: default=_json_default para date/datetime/numpy
+    # ✅ default=_json_default evita errores con date/Timestamp/numpy
     html = HTML_TEMPLATE.replace("__DASH_DATA__", json.dumps(payload, ensure_ascii=False, default=_json_default))
-
     return html.encode("utf-8")
 
 
@@ -1114,7 +1106,6 @@ HTML_TEMPLATE = r"""<!doctype html>
   const mergeDinamo = (pm, joinMode) => {
     const keyPm = new Map();
     // pm está por ruta_norm; para modos con sede/jornada, usamos “lo disponible” => se pega por ruta y listo
-    // (si querés hacerlo exacto por sede/jornada, necesitás pm a ese nivel; acá lo dejamos por ruta_norm para que sea estable)
     pm.forEach((v, rn)=> keyPm.set(rn, v));
 
     const merged = DASH.dinamo.map((d)=>{
@@ -1207,7 +1198,8 @@ HTML_TEMPLATE = r"""<!doctype html>
         const v = (r[key] || "");
         return cols.map((c)=> (v===c ? 1 : 0));
       });
-      return {name:`${prefix} (dummies)`, mat};
+      // ✅ mostrar nombre ORIGINAL (no "dummies")
+      return {name:`${prefix}`, mat};
     };
 
     const jd = addDummies("jornada","Jornada");
@@ -1342,17 +1334,11 @@ HTML_TEMPLATE = r"""<!doctype html>
     } else {
       els.f_ruta.value = "__ALL__";
     }
-
-    // ✅ jornada multi default viene desde Streamlit en ini.jornada_sel
     if (ini.jornada_sel && ini.jornada_sel.length) {
       [...els.f_jornada.options].forEach((o)=>o.selected = ini.jornada_sel.includes(o.value));
     }
-
     if (ini.piloto_sel && ini.piloto_sel.length) {
       [...els.f_piloto.options].forEach((o)=>o.selected = ini.piloto_sel.includes(o.value));
-    }
-    if (ini.ie_sel && ini.ie_sel.length) {
-      [...els.f_ie.options].forEach((o)=>o.selected = ini.ie_sel.includes(o.value));
     }
 
     const onGlobalChange = () => {
@@ -1392,7 +1378,6 @@ HTML_TEMPLATE = r"""<!doctype html>
 </body>
 </html>
 """
-
 
 # =========================
 # Config
@@ -1456,7 +1441,7 @@ def parse_money_like(x: object) -> float:
     s = s.strip()
     try:
         return float(s)
-    except:
+    except Exception:
         return np.nan
 
 
@@ -1473,15 +1458,15 @@ def _parse_percent_series(s: pd.Series) -> pd.Series:
                 x = x[:-1].strip()
                 try:
                     return float(x) / 100.0
-                except:
+                except Exception:
                     return np.nan
             try:
                 return float(x)
-            except:
+            except Exception:
                 return np.nan
         try:
             return float(x)
-        except:
+        except Exception:
             return np.nan
 
     out = s.apply(to_float)
@@ -1523,7 +1508,7 @@ def parse_coef_text(text: str) -> dict:
         name = parts[0].strip()
         try:
             val = float(parts[-1])
-        except:
+        except Exception:
             continue
 
         coef[name] = val
@@ -1875,13 +1860,15 @@ class FilterState:
     ie_sel: Optional[List[str]]
 
 
-def _multiselect_if_exists(df: pd.DataFrame, col: str, label: str):
+def _multiselect_if_exists(df: pd.DataFrame, col: str, label: str, default: Optional[List[str]] = None):
     if col not in df.columns:
         return None
     vals = sorted([v for v in df[col].dropna().unique().tolist() if str(v).strip() != ""])
     if not vals:
         return None
-    return st.multiselect(label, vals, default=[])
+    dflt = default or []
+    dflt = [x for x in dflt if x in vals]
+    return st.multiselect(label, vals, default=dflt)
 
 
 def _select_one_or_all(df: pd.DataFrame, col: str, label: str) -> Optional[List[str]]:
@@ -1918,13 +1905,19 @@ def get_filters(events_df: pd.DataFrame) -> FilterState:
         # ✅ RUTA: “una o todas” (no multiruta)
         ruta_sel = _select_one_or_all(events_df, "ruta", "Ruta (una o todas)")
 
-        # ✅ Jornada multi, DEFAULT: Turno + Ordinaria/Ordinario (según exista)
-        jornada_sel = None
+        # ✅ JORNADA: multi + default SOLO Turno y (Ordinaria/Ordinario)
+        jornada_default = []
         if "jornada" in events_df.columns:
-            jornadas_vals = sorted([v for v in events_df["jornada"].dropna().unique().tolist() if str(v).strip() != ""])
-            if jornadas_vals:
-                default_j = [v for v in jornadas_vals if norm_jornada(v) in {"turno", "ordinario"}]
-                jornada_sel = st.multiselect("Jornada", jornadas_vals, default=default_j)
+            jvals = sorted([v for v in events_df["jornada"].dropna().unique().tolist() if str(v).strip() != ""])
+            if "Turno" in jvals:
+                jornada_default.append("Turno")
+            # tu data puede traer Ordinaria u Ordinario
+            if "Ordinaria" in jvals:
+                jornada_default.append("Ordinaria")
+            elif "Ordinario" in jvals:
+                jornada_default.append("Ordinario")
+
+        jornada_sel = _multiselect_if_exists(events_df, "jornada", "Jornada", default=jornada_default)
 
         piloto_sel = _multiselect_if_exists(events_df, "piloto", "Piloto")
         ie_sel = _multiselect_if_exists(events_df, "Ingreso / Egreso", "Ingreso / Egreso")
@@ -2247,7 +2240,7 @@ def service_level_section(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFr
         if not m.empty and "Capacidad" in m.columns:
             try:
                 current_cap = float(pd.to_numeric(m["Capacidad"], errors="coerce").dropna().iloc[0])
-            except:
+            except Exception:
                 current_cap = None
 
     # tabla de capacidades recomendadas por nivel de servicio (quantiles)
@@ -2271,13 +2264,7 @@ def service_level_section(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFr
         # slider “¿qué pasa si pongo capacidad C?”
         cmin = int(max(0, np.floor(s.min())))
         cmax = int(np.ceil(s.max()))
-        cap_test = st.slider(
-            "Probar capacidad C",
-            min_value=cmin,
-            max_value=max(cmin + 1, cmax),
-            value=min(max(cmin + 1, cmax), int(np.ceil(s.quantile(0.95)))),
-            step=1
-        )
+        cap_test = st.slider("Probar capacidad C", min_value=cmin, max_value=max(cmin + 1, cmax), value=min(max(cmin + 1, cmax), int(np.ceil(s.quantile(0.95)))), step=1)
 
         achieved = float((s <= cap_test).mean() * 100.0)
         overflow = int((s > cap_test).sum())
@@ -2549,7 +2536,7 @@ def dinamo_price_tab(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame])
         b = model_df["Tipo de bus"].astype(str).fillna("")
         bd = pd.get_dummies(b, prefix="bus", drop_first=True)
 
-    # --- orden: por |correlación| para numéricas (más estable visualmente)
+    # --- orden: por |correlación| para numéricas
     feats_ordered = feats_sel[:]
     if order_mode.startswith("Por |correlación|"):
         rows = []
@@ -2567,11 +2554,12 @@ def dinamo_price_tab(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame])
     for c in feats_ordered:
         blocks.append((c, model_df[c].to_numpy(dtype=float).reshape(-1, 1)))
 
+    # ✅ mostrar nombre ORIGINAL (no "dummies")
     if include_jornada and jd is not None and jd.shape[1] > 0:
-        blocks.append(("Jornada (dummies)", jd.to_numpy(dtype=float)))
+        blocks.append(("Jornada", jd.to_numpy(dtype=float)))
 
     if include_bus and bd is not None and bd.shape[1] > 0:
-        blocks.append(("Tipo de bus (dummies)", bd.to_numpy(dtype=float)))
+        blocks.append(("Tipo de bus", bd.to_numpy(dtype=float)))
 
     # --- función local: calcula R² con intercept + bloques
     def r2_for(block_mats: list[np.ndarray]) -> float:
@@ -2606,7 +2594,7 @@ def dinamo_price_tab(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame])
     st.write(f"R² total del modelo (con todo): **{total_r2:.3f}**")
     st.dataframe(out, use_container_width=True)
 
-    # --- waterfall: empieza en 0, suma ΔR², termina en R² total
+    # --- waterfall
     labels = ["R² inicial"] + [b[0] for b in blocks] + ["R² total"]
     values = [0.0] + deltas + [0.0]
     measures = ["absolute"] + ["relative"] * len(deltas) + ["total"]
@@ -2694,18 +2682,16 @@ def main():
         else:
             ev_for_html = events_f
 
-        # ✅ FIX: date_range debe ir como strings YYYY-MM-DD
-        date_range_for_json = None
+        # ✅ date_range a strings ISO (y además json default seguro)
+        date_range_iso = None
         if fs.date_range and isinstance(fs.date_range, tuple) and len(fs.date_range) == 2:
-            date_range_for_json = [
-                (d.isoformat() if hasattr(d, "isoformat") else str(d)) for d in fs.date_range
-            ]
+            date_range_iso = [_iso_date(fs.date_range[0]), _iso_date(fs.date_range[1])]
 
         html_bytes = build_dashboard_html(
             ev_for_html,
             dinamo,
             initial_filters={
-                "date_range": date_range_for_json,
+                "date_range": date_range_iso,
                 "corredor_sel": fs.corredor_sel,
                 "sede_sel": fs.sede_sel,
                 "ruta_sel": fs.ruta_sel,
