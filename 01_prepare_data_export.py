@@ -122,7 +122,8 @@ def main():
     # Datetimes
     # =========================
     # Hora de inicio viene así: 6/21/24 10:19:59
-    df = parse_datetime_col(df, "Hora de inicio", "Momento de inicio")
+    # Hay una columna "mes", "dia" y otra "año". Probar esas y si no vienen usar Hora de inicio. Lo mismo para finalización. La idea es tener columnas tipo datetime para poder sacar derivados como fecha, hora, turno, etc.
+    df["Momento de inicio"] = df.apply(lambda row: row["Hora de inicio"] if pd.notna(row.get("Hora de inicio", np.nan)) else f"{row.get('mes', '')}/{row.get('dia', '')}/{row.get('año', '')} 00:00:00", axis=1)
     df = parse_datetime_col(df, "Hora de finalización", "Momento de finalización")
 
     # derivados (opcionales)

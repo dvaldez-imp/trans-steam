@@ -951,7 +951,7 @@ with tab4:
             "Quintiles (20/40/60/80)",
             "Deciles (10..90)"
         ],
-        index=0
+        index=2
     )
 
     if q_mode.startswith("Cuartiles"):
@@ -1049,3 +1049,21 @@ with tab4:
         file_name="reco.csv",
         mime="text/csv"
     )
+
+    # Ultimo excel de resumen global
+    st.subheader("Resumen global (último Excel)")
+    st.markdown("- Si quieres ver el resumen global con los últimos datos, descargá el último Excel de resumen que se genera en la carpeta `output/` del repo. Ahí se incluye toda la data procesada y las recomendaciones, con los mismos formatos de cuantiles y métricas que ves en esta app.")
+    # Crear excel con data en cada hoja. Primero la hoja de resumen con el summary en modo deciles, y luego una hoja con el reco detallado.
+    output_path = "output/resumen_global.xlsx"
+    with pd.ExcelWriter(output_path) as writer:
+        # Primero el summary show, solo con las columnas que se muestran en la tabla de resumen, para que sea fácil de leer. Ordenado por ruta y turno.
+        summary_show[cols].sort_values(["Ruta", TURN_COL]).to_excel(writer, sheet_name="Resumen", index=False)
+        # Reco detallado
+        reco.to_excel(writer, sheet_name="Reco detallado", index=False)
+        # Otra hoja con las distribuciones de pasajeros por grupo. Tomar el grupo, la cantidad de pasajeros. Agruparlo por grupo, dar districion de la cantida de pasajeros (conteo de cada cantidad de pasajeros por grupo). Luego en base a la ruta poner el porcentaje. De que tan probable es que esa cantidad de pasajeros ocurra en ese grupo. Esto es para tener la data de la PMF de pasajeros por grupo, que es la base de todo el análisis.
+        dist = df_raw.groupby(["Ruta", TURN_COL, PAX_COL]).size().reset_index(name="count")
+        dist["prob"] = dist.groupby(["Ruta", TURN_COL])["count"].transform(lambda s: s / s.sum())
+        dist.to_excel(writer, sheet_name="Distribución pasajeros", index=False)
+    st.markdown(f"- [Descargar resumen global Excel]({output_path})")
+
+
