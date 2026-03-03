@@ -1,2739 +1,1051 @@
-# app.py
-import re
-import unicodedata
-from datetime import date, datetime
+# 02_app_streamlit.py
+# -*- coding: utf-8 -*-
+
 import numpy as np
 import pandas as pd
 import streamlit as st
 import plotly.express as px
 import plotly.graph_objects as go
-from dataclasses import dataclass
-from typing import Optional, List, Tuple, Dict
-import json
+
+import statsmodels.api as sm
 
 
 # =========================
-# ✅ JSON helpers (para evitar: date / Timestamp / numpy not JSON serializable)
+# CONFIG / Defaults
 # =========================
-def _json_default(o):
-    # fechas/tiempos
-    if isinstance(o, (datetime, pd.Timestamp)):
-        return o.isoformat()
-    if isinstance(o, date):
-        return o.isoformat()
-
-    # numpy scalars/arrays
-    if isinstance(o, np.integer):
-        return int(o)
-    if isinstance(o, np.floating):
-        return float(o)
-    if isinstance(o, np.ndarray):
-        return o.tolist()
-
-    # pandas Period/Categorical/etc
-    if isinstance(o, pd.Period):
-        return str(o)
-
-    # fallback seguro
-    return str(o)
-
-
-def _iso_date(x):
-    try:
-        return x.isoformat()
-    except Exception:
-        return str(x)
-
-
-def build_dashboard_html(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame], initial_filters: dict) -> bytes:
-    # -------------------------
-    # 1) Preparar data “limpia” para el navegador (keys sin espacios)
-    # -------------------------
-    ev = events_df.copy()
-
-    # columnas base que usás en el dashboard
-    # (si alguna no existe, la creamos vacía)
-    need_cols = [
-        "inicio_dt", "fin_dt", "duracion_s",
-        "pct_ocup", "fecha", "mes_ym", "dia_semana",
-        "ruta", "sede", "jornada", "piloto",
-        "ie_norm", "corredor_desc",
-        "Cantidad de correlativos", "Ocupación máxima", "horario de turno",
-        "ruta_norm", "sede_norm", "jornada_norm",
-    ]
-    for c in need_cols:
-        if c not in ev.columns:
-            ev[c] = np.nan
-
-    # renombrar a keys JS-friendly
-    ev_out = pd.DataFrame({
-        "inicio_dt": pd.to_datetime(ev["inicio_dt"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "fin_dt": pd.to_datetime(ev["fin_dt"], errors="coerce").dt.strftime("%Y-%m-%dT%H:%M:%S"),
-        "duracion_s": pd.to_numeric(ev["duracion_s"], errors="coerce"),
-        "pct_ocup": pd.to_numeric(ev["pct_ocup"], errors="coerce"),  # 0..1
-        "fecha": ev["fecha"].astype(str),
-        "mes_ym": ev["mes_ym"].astype(str),
-        "dia_semana": ev["dia_semana"].astype(str),
-        "ruta": ev["ruta"].astype(str),
-        "sede": ev["sede"].astype(str),
-        "jornada": ev["jornada"].astype(str),
-        "piloto": ev["piloto"].astype(str),
-        "ie_norm": ev["ie_norm"].astype(str),
-        "corredor_desc": ev["corredor_desc"].astype(str),
-        "correlativos": pd.to_numeric(ev["Cantidad de correlativos"], errors="coerce"),
-        "ocup_max": pd.to_numeric(ev["Ocupación máxima"], errors="coerce"),
-        "horario_turno": ev["horario de turno"].astype(str),
-        "ruta_norm": ev["ruta_norm"].astype(str),
-        "sede_norm": ev["sede_norm"].astype(str),
-        "jornada_norm": ev["jornada_norm"].astype(str),
-    })
-
-    # NaN -> None (para JSON)
-    ev_out = ev_out.where(pd.notna(ev_out), None)
-
-    din_records = []
-    cap_map = {}
-    if dinamo_df is not None and not dinamo_df.empty:
-        d = dinamo_df.copy()
-
-        # asegurar columnas esperadas
-        d_need = [
-            "Ruta", "Sede", "Jornada", "Tipo de bus",
-            "Km", "Tiempo (minutos)", "Capacidad", "# Días", "Precio Q (Diario)",
-            "ruta_norm", "sede_norm", "jornada_norm"
-        ]
-        for c in d_need:
-            if c not in d.columns:
-                d[c] = np.nan
-
-        d_out = pd.DataFrame({
-            "ruta": d["Ruta"].astype(str),
-            "sede": d["Sede"].astype(str),
-            "jornada": d["Jornada"].astype(str),
-            "bus_tipo": d["Tipo de bus"].astype(str),
-            "km": pd.to_numeric(d["Km"], errors="coerce"),
-            "tiempo_min": pd.to_numeric(d["Tiempo (minutos)"], errors="coerce"),
-            "capacidad": pd.to_numeric(d["Capacidad"], errors="coerce"),
-            "dias": pd.to_numeric(d["# Días"], errors="coerce"),
-            "precio_q": pd.to_numeric(d["Precio Q (Diario)"], errors="coerce"),
-            "ruta_norm": d["ruta_norm"].astype(str),
-            "sede_norm": d["sede_norm"].astype(str),
-            "jornada_norm": d["jornada_norm"].astype(str),
-        })
-        d_out = d_out.where(pd.notna(d_out), None)
-        din_records = d_out.to_dict(orient="records")
-
-        # mapa de capacidad por ruta (para la línea “Cap. Dinamo”)
-        for r in din_records:
-            rr = (r.get("ruta") or "").strip()
-            cap = r.get("capacidad")
-            if rr and cap is not None and rr not in cap_map:
-                cap_map[rr] = cap
-
-    events_records = ev_out.to_dict(orient="records")
-
-    # -------------------------
-    # 2) Template HTML (Plotly + MathJS por CDN)
-    # -------------------------
-    init = initial_filters or {}
-    payload = {
-        "events": events_records,
-        "dinamo": din_records,
-        "cap_by_route": cap_map,
-        "init": init,
-        "weekday_order": ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"],
-    }
-
-    # ✅ default=_json_default evita errores con date/Timestamp/numpy
-    html = HTML_TEMPLATE.replace("__DASH_DATA__", json.dumps(payload, ensure_ascii=False, default=_json_default))
-    return html.encode("utf-8")
-
-
-HTML_TEMPLATE = r"""<!doctype html>
-<html lang="es">
-<head>
-  <meta charset="utf-8"/>
-  <meta name="viewport" content="width=device-width,initial-scale=1"/>
-  <title>Dashboard Rutas (HTML)</title>
-
-  <!-- CDN (si querés offline, bajás estos .js y apuntás local) -->
-  <script src="https://cdn.plot.ly/plotly-2.30.0.min.js"></script>
-  <script src="https://cdn.jsdelivr.net/npm/mathjs@12.4.2/lib/browser/math.min.js"></script>
-
-  <style>
-    body{font-family:system-ui,-apple-system,Segoe UI,Roboto,Ubuntu,"Helvetica Neue",Arial; margin:0; background:#0b1020; color:#e9edf7;}
-    .wrap{max-width:1400px; margin:0 auto; padding:18px;}
-    .card{background:#111a33; border:1px solid rgba(255,255,255,.08); border-radius:14px; padding:14px; box-shadow:0 10px 24px rgba(0,0,0,.25);}
-    .grid{display:grid; gap:12px;}
-    .grid.kpis{grid-template-columns:repeat(4,minmax(0,1fr));}
-    .kpi .label{opacity:.8; font-size:12px;}
-    .kpi .value{font-size:22px; font-weight:700; margin-top:6px;}
-    .row{display:flex; gap:12px; flex-wrap:wrap;}
-    label{font-size:12px; opacity:.85; display:block; margin-bottom:6px;}
-    select,input{background:#0b1020; color:#e9edf7; border:1px solid rgba(255,255,255,.14); border-radius:10px; padding:8px; min-width:180px;}
-    select[multiple]{min-height:110px;}
-    .tabs{display:flex; gap:8px; margin:14px 0;}
-    .tabbtn{cursor:pointer; padding:10px 12px; border-radius:12px; border:1px solid rgba(255,255,255,.14); background:#0b1020; color:#e9edf7;}
-    .tabbtn.active{background:#1b2a55;}
-    .tab{display:none;}
-    .tab.active{display:block;}
-    .h2{font-size:16px; font-weight:800; margin:0 0 10px;}
-    .muted{opacity:.75;}
-    .plots-grid{display:grid; grid-template-columns:repeat(2,minmax(0,1fr)); gap:12px;}
-    table{width:100%; border-collapse:collapse; font-size:12px;}
-    th,td{border-bottom:1px solid rgba(255,255,255,.10); padding:8px; text-align:left;}
-  </style>
-</head>
-<body>
-<div class="wrap">
-
-  <div class="card">
-    <div class="h2">Rutas — Dashboard (HTML dinámico)</div>
-    <div class="muted">Filtros globales (aplican a todas las pestañas)</div>
-    <div class="row" style="margin-top:10px;">
-      <div>
-        <label>Fecha desde</label>
-        <input id="f_date0" type="date"/>
-      </div>
-      <div>
-        <label>Fecha hasta</label>
-        <input id="f_date1" type="date"/>
-      </div>
-      <div>
-        <label>Corredor (multi)</label>
-        <select id="f_corr" multiple></select>
-      </div>
-      <div>
-        <label>Sede (multi)</label>
-        <select id="f_sede" multiple></select>
-      </div>
-      <div>
-        <label>Ruta (una o todas)</label>
-        <select id="f_ruta"></select>
-      </div>
-      <div>
-        <label>Jornada (multi)</label>
-        <select id="f_jornada" multiple></select>
-      </div>
-      <div>
-        <label>Piloto (multi)</label>
-        <select id="f_piloto" multiple></select>
-      </div>
-      <div>
-        <label>Ingreso/Egreso (multi)</label>
-        <select id="f_ie" multiple></select>
-      </div>
-    </div>
-  </div>
-
-  <div class="tabs">
-    <button class="tabbtn active" data-tab="t1">Dashboard general</button>
-    <button class="tabbtn" data-tab="t2">Series / cascada / servicio</button>
-    <button class="tabbtn" data-tab="t3">Dinamo: Precio</button>
-  </div>
-
-  <!-- TAB 1 -->
-  <div id="t1" class="tab active">
-    <div class="grid kpis" style="margin-bottom:12px;">
-      <div class="card kpi"><div class="label">Movimientos</div><div id="k_mov" class="value">—</div></div>
-      <div class="card kpi"><div class="label">Ingreso / Egreso</div><div id="k_ie" class="value">—</div></div>
-      <div class="card kpi"><div class="label">% ocupación (prom.)</div><div id="k_pct" class="value">—</div></div>
-      <div class="card kpi"><div class="label">Capacidad típica (mediana)</div><div id="k_cap" class="value">—</div></div>
-    </div>
-
-    <div class="card">
-      <div class="h2">Caja y bigotes — por mes / día semana</div>
-      <div class="row" style="margin:10px 0;">
-        <div>
-          <label>Agrupar por</label>
-          <select id="box_group">
-            <option>Mes</option>
-            <option>Día de la semana</option>
-          </select>
-        </div>
-        <div>
-          <label>Métrica</label>
-          <select id="box_metric">
-            <option>Demanda (correlativos)</option>
-            <option>% ocupación</option>
-          </select>
-        </div>
-        <div>
-          <label>Ruta (local)</label>
-          <select id="box_ruta"></select>
-        </div>
-        <div>
-          <label>Jornadas (local, multi)</label>
-          <select id="box_jornadas" multiple></select>
-        </div>
-        <div>
-          <label>Movimiento (local)</label>
-          <select id="box_dir">
-            <option>Ambos</option>
-            <option>Ingreso</option>
-            <option>Egreso</option>
-          </select>
-        </div>
-      </div>
-      <div id="boxplot" style="height:520px;"></div>
-    </div>
-  </div>
-
-  <!-- TAB 2 -->
-  <div id="t2" class="tab">
-    <div class="card" style="margin-bottom:12px;">
-      <div class="h2">Cascada — Total → descomposición por jornada</div>
-      <div class="row" style="margin:10px 0;">
-        <div>
-          <label>Grupo</label>
-          <select id="wf_group">
-            <option>Mes</option>
-            <option>Día de la semana</option>
-          </select>
-        </div>
-        <div>
-          <label>Métrica</label>
-          <select id="wf_measure">
-            <option>Movimientos (conteo)</option>
-            <option>Demanda (suma)</option>
-          </select>
-        </div>
-        <div>
-          <label>Máx. gráficos</label>
-          <input id="wf_max" type="number" min="1" max="30" value="8"/>
-        </div>
-        <div>
-          <label>Movimiento</label>
-          <select id="wf_dir">
-            <option>Ambos</option>
-            <option>Ingreso</option>
-            <option>Egreso</option>
-          </select>
-        </div>
-        <div>
-          <label>Jornadas (multi)</label>
-          <select id="wf_jornadas" multiple></select>
-        </div>
-      </div>
-      <div id="wf_grid" class="plots-grid"></div>
-    </div>
-
-    <div class="card" style="margin-bottom:12px;">
-      <div class="h2">Series de tiempo</div>
-      <div class="row" style="margin:10px 0;">
-        <div>
-          <label>Granularidad</label>
-          <select id="ts_gran">
-            <option>Día</option>
-            <option selected>Semana</option>
-            <option>Mes</option>
-          </select>
-        </div>
-        <div>
-          <label>Métrica</label>
-          <select id="ts_metric">
-            <option>Movimientos</option>
-            <option>Demanda (suma)</option>
-            <option>Demanda (P95)</option>
-          </select>
-        </div>
-        <div>
-          <label>Separar por</label>
-          <select id="ts_split">
-            <option>Nada</option>
-            <option>Ingreso/Egreso</option>
-            <option>Jornada</option>
-          </select>
-        </div>
-      </div>
-      <div id="ts_plot" style="height:520px;"></div>
-    </div>
-
-    <div class="card">
-      <div class="h2">Acumulado: nivel de servicio vs capacidad</div>
-      <div class="row" style="margin:10px 0;">
-        <div>
-          <label>Ruta</label>
-          <select id="svc_ruta"></select>
-        </div>
-        <div>
-          <label>Movimiento</label>
-          <select id="svc_dir">
-            <option>Ambos</option>
-            <option>Ingreso</option>
-            <option>Egreso</option>
-          </select>
-        </div>
-        <div>
-          <label>Unidad</label>
-          <select id="svc_unit">
-            <option>Registro</option>
-            <option selected>Día (máximo)</option>
-            <option>Día+Turno (máximo)</option>
-          </select>
-        </div>
-        <div>
-          <label>Objetivos (multi)</label>
-          <select id="svc_levels" multiple>
-            <option value="0.80">80%</option>
-            <option value="0.85">85%</option>
-            <option value="0.90" selected>90%</option>
-            <option value="0.95" selected>95%</option>
-            <option value="0.97">97%</option>
-            <option value="0.99">99%</option>
-          </select>
-        </div>
-      </div>
-
-      <div class="row" style="margin:10px 0;">
-        <div class="card" style="flex:1;">
-          <div class="muted" style="margin-bottom:8px;">Capacidades recomendadas</div>
-          <div id="svc_table"></div>
-        </div>
-        <div class="card" style="flex:1;">
-          <div class="muted" style="margin-bottom:8px;">Probar capacidad C</div>
-          <input id="svc_cap_test" type="range" min="0" max="1" value="1" step="1" style="width:100%;">
-          <div class="row" style="margin-top:10px;">
-            <div style="flex:1;"><div class="label">Nivel logrado</div><div id="svc_ach" class="value">—</div></div>
-            <div style="flex:1;"><div class="label">Casos excedidos</div><div id="svc_over" class="value">—</div></div>
-          </div>
-        </div>
-      </div>
-
-      <div id="svc_ecdf" style="height:520px; margin-top:12px;"></div>
-    </div>
-  </div>
-
-  <!-- TAB 3 -->
-  <div id="t3" class="tab">
-    <div class="card">
-      <div class="h2">Dinamo: Precio Q (Diario) — correlación + cascada ΔR²</div>
-
-      <div class="row" style="margin:10px 0;">
-        <div>
-          <label>Join mode</label>
-          <select id="p_join">
-            <option>Ruta</option>
-            <option>Ruta + Jornada</option>
-            <option>Ruta + Sede</option>
-            <option>Ruta + Sede + Jornada</option>
-          </select>
-        </div>
-        <div>
-          <label>Correlación</label>
-          <select id="p_corr">
-            <option>pearson</option>
-            <option selected>spearman</option>
-          </select>
-        </div>
-        <div>
-          <label>Piloto significativo: share mínimo</label>
-          <input id="p_min_share" type="number" min="0.05" max="0.50" step="0.01" value="0.15"/>
-        </div>
-        <div>
-          <label>Eventos mínimos por piloto</label>
-          <input id="p_min_total" type="number" min="1" step="1" value="30"/>
-        </div>
-        <div>
-          <label>Bucket min eventos (día+turno)</label>
-          <input id="p_bucket_min" type="number" min="1" step="1" value="2"/>
-        </div>
-      </div>
-
-      <div class="card" style="margin-top:10px;">
-        <div class="h2">1) Correlación numérica vs Precio</div>
-        <div id="p_corr_tbl"></div>
-      </div>
-
-      <div class="card" style="margin-top:10px;">
-        <div class="h2">2) Categóricas vs Precio</div>
-        <div class="row" style="margin:10px 0;">
-          <div>
-            <label>Categoría</label>
-            <select id="p_cat">
-              <option>Jornada</option>
-              <option>Tipo de bus</option>
-            </select>
-          </div>
-        </div>
-        <div id="p_cat_plot" style="height:520px;"></div>
-        <div id="p_cat_tbl" style="margin-top:10px;"></div>
-      </div>
-
-      <div class="card" style="margin-top:10px;">
-        <div class="h2">3) Cascada ΔR² (nested OLS)</div>
-        <div class="muted">Ojo: si hay demasiadas filas/categorías puede tardar; se muestrea si es enorme.</div>
-        <div id="p_r2_plot" style="height:520px; margin-top:10px;"></div>
-        <div id="p_r2_tbl" style="margin-top:10px;"></div>
-      </div>
-    </div>
-  </div>
-
-</div>
-
-<script>
-  // ============================
-  // DATA
-  // ============================
-  const DASH = __DASH_DATA__;
-  const WEEKDAY_ORDER = DASH.weekday_order || ["Lunes","Martes","Miércoles","Jueves","Viernes","Sábado","Domingo"];
-
-  // ============================
-  // Helpers (arrow functions only)
-  // ============================
-  const uniqSorted = (arr) => [...new Set(arr.filter((x) => x !== null && x !== undefined && String(x).trim() !== ""))].sort((a,b)=>String(a).localeCompare(String(b)));
-  const getMulti = (sel) => [...sel.selectedOptions].map((o) => o.value);
-  const setOptions = (sel, values, {includeAll=false, allLabel="Todas"} = {}) => {
-    const prev = new Set([...sel.options].filter((o)=>o.selected).map((o)=>o.value));
-    sel.innerHTML = "";
-    if (includeAll) {
-      const opt = document.createElement("option");
-      opt.value = "__ALL__";
-      opt.textContent = allLabel;
-      sel.appendChild(opt);
-    }
-    values.forEach((v) => {
-      const opt = document.createElement("option");
-      opt.value = v;
-      opt.textContent = v;
-      if (prev.has(v)) opt.selected = true;
-      sel.appendChild(opt);
-    });
-  };
-
-  const parseDateOnly = (iso) => {
-    if (!iso) return null;
-    const s = String(iso).slice(0,10);
-    if (!s || s.length !== 10) return null;
-    return s;
-  };
-
-  const corrPearson = (xs, ys) => {
-    const n = xs.length;
-    if (n < 3) return null;
-    const mx = xs.reduce((a,b)=>a+b,0)/n;
-    const my = ys.reduce((a,b)=>a+b,0)/n;
-    let num=0, dx=0, dy=0;
-    for (let i=0;i<n;i++){
-      const vx = xs[i]-mx;
-      const vy = ys[i]-my;
-      num += vx*vy;
-      dx += vx*vx;
-      dy += vy*vy;
-    }
-    const den = Math.sqrt(dx*dy);
-    if (!isFinite(den) || den===0) return null;
-    return num/den;
-  };
-
-  const rankAvg = (arr) => {
-    const idx = arr.map((v,i)=>[v,i]).sort((a,b)=>a[0]-b[0]);
-    const ranks = Array(arr.length).fill(0);
-    let i=0;
-    while(i<idx.length){
-      let j=i;
-      while(j<idx.length && idx[j][0]===idx[i][0]) j++;
-      const r = (i+1 + j)/2; // promedio
-      for(let k=i;k<j;k++) ranks[idx[k][1]] = r;
-      i=j;
-    }
-    return ranks;
-  };
-
-  const corrSpearman = (xs, ys) => corrPearson(rankAvg(xs), rankAvg(ys));
-
-  const quantile = (arr, q) => {
-    const xs = arr.filter((v)=>v!==null && v!==undefined && isFinite(v)).slice().sort((a,b)=>a-b);
-    if (!xs.length) return null;
-    const pos = (xs.length - 1) * q;
-    const base = Math.floor(pos);
-    const rest = pos - base;
-    if ((xs[base+1] !== undefined)) return xs[base] + rest * (xs[base+1] - xs[base]);
-    return xs[base];
-  };
-
-  const timeBin = (iso, gran) => {
-    if (!iso) return null;
-    const d = new Date(iso);
-    if (!isFinite(d)) return null;
-    const yyyy = d.getFullYear();
-    const mm = d.getMonth();
-    const dd = d.getDate();
-
-    if (gran === "Día") return new Date(yyyy, mm, dd).toISOString().slice(0,10);
-
-    if (gran === "Mes") return new Date(yyyy, mm, 1).toISOString().slice(0,10);
-
-    // Semana (inicio lunes)
-    const day = d.getDay(); // 0 dom ... 1 lun ...
-    const delta = (day === 0 ? -6 : 1 - day);
-    const w = new Date(yyyy, mm, dd + delta);
-    return new Date(w.getFullYear(), w.getMonth(), w.getDate()).toISOString().slice(0,10);
-  };
-
-  const groupAgg = (rows, keyFn, valFn, aggFn) => {
-    const m = new Map();
-    rows.forEach((r) => {
-      const k = keyFn(r);
-      if (k === null || k === undefined) return;
-      const v = valFn(r);
-      if (v === null || v === undefined || !isFinite(v)) return;
-      if (!m.has(k)) m.set(k, []);
-      m.get(k).push(v);
-    });
-    const out = [];
-    m.forEach((vals, k) => out.push([k, aggFn(vals)]));
-    return out;
-  };
-
-  const renderTable = (rows, cols) => {
-    if (!rows || !rows.length) return "<div class='muted'>Sin datos</div>";
-    const thead = "<tr>" + cols.map((c)=>`<th>${c}</th>`).join("") + "</tr>";
-    const tbody = rows.map((r)=>"<tr>" + cols.map((c)=>`<td>${r[c] ?? "—"}</td>`).join("") + "</tr>").join("");
-    return `<table><thead>${thead}</thead><tbody>${tbody}</tbody></table>`;
-  };
-
-  // ============================
-  // Global filters
-  // ============================
-  const els = {
-    f_date0: document.getElementById("f_date0"),
-    f_date1: document.getElementById("f_date1"),
-    f_corr: document.getElementById("f_corr"),
-    f_sede: document.getElementById("f_sede"),
-    f_ruta: document.getElementById("f_ruta"),
-    f_jornada: document.getElementById("f_jornada"),
-    f_piloto: document.getElementById("f_piloto"),
-    f_ie: document.getElementById("f_ie"),
-  };
-
-  const state = {
-    global: {
-      date0: null,
-      date1: null,
-      corr: [],
-      sede: [],
-      ruta: "__ALL__",
-      jornada: [],
-      piloto: [],
-      ie: [],
-    }
-  };
-
-  const applyGlobal = (rows) => {
-    const g = state.global;
-    return rows.filter((r) => {
-      const d = parseDateOnly(r.inicio_dt);
-      if (g.date0 && d && d < g.date0) return false;
-      if (g.date1 && d && d > g.date1) return false;
-
-      if (g.corr.length && !g.corr.includes(r.corredor_desc)) return false;
-      if (g.sede.length && !g.sede.includes(r.sede)) return false;
-      if (g.ruta !== "__ALL__" && String(r.ruta).trim() !== String(g.ruta).trim()) return false;
-      if (g.jornada.length && !g.jornada.includes(r.jornada)) return false;
-      if (g.piloto.length && !g.piloto.includes(r.piloto)) return false;
-      if (g.ie.length && !g.ie.includes(r.ie_norm)) return false;
-      return true;
-    });
-  };
-
-  // ============================
-  // Render: KPI
-  // ============================
-  const renderKPI = (rows) => {
-    document.getElementById("k_mov").textContent = (rows.length || 0).toLocaleString("es-GT");
-
-    const ing = rows.filter((r)=>r.ie_norm==="ingreso").length;
-    const egr = rows.filter((r)=>r.ie_norm==="egreso").length;
-    document.getElementById("k_ie").textContent = `${ing} / ${egr}`;
-
-    const pcts = rows.map((r)=> (r.pct_ocup!==null && r.pct_ocup!==undefined) ? Number(r.pct_ocup) : null).filter((v)=>v!==null && isFinite(v));
-    const mp = pcts.length ? (pcts.reduce((a,b)=>a+b,0)/pcts.length) : null;
-    document.getElementById("k_pct").textContent = (mp===null) ? "—" : `${(mp*100).toFixed(1)}%`;
-
-    const caps = rows.map((r)=> (r.ocup_max!==null && r.ocup_max!==undefined) ? Number(r.ocup_max) : null).filter((v)=>v!==null && isFinite(v)).sort((a,b)=>a-b);
-    const med = caps.length ? caps[Math.floor(caps.length/2)] : null;
-    document.getElementById("k_cap").textContent = (med===null) ? "—" : `${Math.round(med)}`;
-  };
-
-  // ============================
-  // TAB 1: Boxplot
-  // ============================
-  const renderBoxplot = (rows) => {
-    const group = document.getElementById("box_group").value;
-    const metric = document.getElementById("box_metric").value;
-    const ruta = document.getElementById("box_ruta").value;
-    const jornadasSel = getMulti(document.getElementById("box_jornadas"));
-    const dir = document.getElementById("box_dir").value;
-
-    let base = rows.slice();
-    if (ruta !== "__ALL__") base = base.filter((r)=>String(r.ruta)===String(ruta));
-    if (jornadasSel.length) base = base.filter((r)=>jornadasSel.includes(r.jornada));
-    if (dir !== "Ambos") base = base.filter((r)=> r.ie_norm === (dir==="Ingreso" ? "ingreso" : "egreso"));
-
-    const gcol = (group==="Mes") ? "mes_ym" : "dia_semana";
-
-    const groups = new Map();
-    base.forEach((r) => {
-      const k = r[gcol];
-      if (!k) return;
-      let v = null;
-      if (metric.startsWith("%")) v = (r.pct_ocup!==null && isFinite(r.pct_ocup)) ? (Number(r.pct_ocup)*100) : null;
-      else v = (r.correlativos!==null && isFinite(r.correlativos)) ? Number(r.correlativos) : null;
-      if (v===null) return;
-      if (!groups.has(k)) groups.set(k, []);
-      groups.get(k).push(v);
-    });
-
-    let keys = [...groups.keys()];
-    if (gcol === "dia_semana") keys = WEEKDAY_ORDER.filter((d)=>keys.includes(d));
-    else keys = keys.sort();
-
-    const traces = keys.map((k)=>({
-      type: "box",
-      name: k,
-      y: groups.get(k),
-      boxpoints: "outliers"
-    }));
-
-    const layout = {
-      title: metric + " por " + group,
-      paper_bgcolor: "rgba(0,0,0,0)",
-      plot_bgcolor: "rgba(0,0,0,0)",
-      font: {color:"#e9edf7"},
-      xaxis: {title: group},
-      yaxis: {title: metric},
-      margin: {l:60,r:20,t:50,b:60}
-    };
-    Plotly.react("boxplot", traces, layout, {responsive:true});
-  };
-
-  // ============================
-  // TAB 2: Waterfall por grupo
-  // ============================
-  const renderWaterfalls = (rows) => {
-    const group = document.getElementById("wf_group").value;
-    const measure = document.getElementById("wf_measure").value;
-    const maxN = Math.max(1, Math.min(30, Number(document.getElementById("wf_max").value || 8)));
-    const dir = document.getElementById("wf_dir").value;
-    const jornadasSel = getMulti(document.getElementById("wf_jornadas"));
-
-    const gcol = (group==="Mes") ? "mes_ym" : "dia_semana";
-
-    let base = rows.slice();
-    if (jornadasSel.length) base = base.filter((r)=>jornadasSel.includes(r.jornada));
-    if (dir !== "Ambos") base = base.filter((r)=> r.ie_norm === (dir==="Ingreso" ? "ingreso" : "egreso"));
-
-    const totalMap = new Map();
-    base.forEach((r)=>{
-      const k = r[gcol];
-      if (!k) return;
-      const add = (measure.startsWith("Mov")) ? 1 : (isFinite(r.correlativos) ? Number(r.correlativos) : null);
-      if (add===null) return;
-      totalMap.set(k, (totalMap.get(k) || 0) + add);
-    });
-
-    let groups = [...totalMap.entries()].sort((a,b)=>b[1]-a[1]).slice(0, maxN).map((x)=>x[0]);
-    if (gcol === "dia_semana") groups = WEEKDAY_ORDER.filter((d)=>groups.includes(d));
-
-    const grid = document.getElementById("wf_grid");
-    grid.innerHTML = "";
-
-    groups.forEach((g, idx) => {
-      const div = document.createElement("div");
-      div.className = "card";
-      div.style.height = "420px";
-      div.id = `wf_${idx}`;
-      grid.appendChild(div);
-
-      const byJ = new Map();
-      base.forEach((r)=>{
-        if (r[gcol] !== g) return;
-        const j = r.jornada || "—";
-        const add = (measure.startsWith("Mov")) ? 1 : (isFinite(r.correlativos) ? Number(r.correlativos) : null);
-        if (add===null) return;
-        byJ.set(j, (byJ.get(j) || 0) + add);
-      });
-
-      const rowsJ = [...byJ.entries()].sort((a,b)=>b[1]-a[1]);
-      const labels = rowsJ.map((x)=>x[0]).concat(["Total"]);
-      const values = rowsJ.map((x)=>x[1]).concat([0]);
-      const measures = rowsJ.map(()=> "relative").concat(["total"]);
-
-      const fig = [{
-        type:"waterfall",
-        x: labels,
-        y: values,
-        measure: measures
-      }];
-
-      const layout = {
-        title: `${measure} – ${group}: ${g} (${dir})`,
-        paper_bgcolor:"rgba(0,0,0,0)",
-        plot_bgcolor:"rgba(0,0,0,0)",
-        font:{color:"#e9edf7"},
-        margin:{l:60,r:20,t:60,b:60},
-        xaxis:{title:"Jornada"},
-        yaxis:{title: measure.startsWith("Mov") ? "Movimientos" : "Demanda (suma)"}
-      };
-
-      Plotly.newPlot(div.id, fig, layout, {responsive:true});
-    });
-  };
-
-  // ============================
-  // TAB 2: Timeseries
-  // ============================
-  const renderTimeseries = (rows) => {
-    const gran = document.getElementById("ts_gran").value;
-    const metric = document.getElementById("ts_metric").value;
-    const split = document.getElementById("ts_split").value;
-
-    const base = rows.filter((r)=>!!r.inicio_dt);
-    const colorFn = (r) => {
-      if (split === "Ingreso/Egreso") return (r.ie_norm==="ingreso" ? "Ingreso" : (r.ie_norm==="egreso" ? "Egreso" : "Otro"));
-      if (split === "Jornada") return r.jornada || "—";
-      return "Total";
-    };
-
-    const agg = new Map();
-    base.forEach((r)=>{
-      const t = timeBin(r.inicio_dt, gran);
-      if (!t) return;
-      const c = colorFn(r);
-      const k = `${t}||${c}`;
-      if (!agg.has(k)) agg.set(k, []);
-      if (metric === "Movimientos") agg.get(k).push(1);
-      else {
-        const d = (isFinite(r.correlativos) ? Number(r.correlativos) : null);
-        if (d===null) return;
-        agg.get(k).push(d);
-      }
-    });
-
-    const points = [];
-    agg.forEach((vals, k)=>{
-      const [t,c] = k.split("||");
-      let v = null;
-      if (metric === "Movimientos") v = vals.length;
-      else if (metric === "Demanda (suma)") v = vals.reduce((a,b)=>a+b,0);
-      else v = quantile(vals, 0.95);
-      if (v===null) return;
-      points.push({t, c, v});
-    });
-
-    points.sort((a,b)=>a.t.localeCompare(b.t));
-
-    const colors = uniqSorted(points.map((p)=>p.c));
-    const traces = colors.map((c)=>({
-      type:"scatter",
-      mode:"lines+markers",
-      name: c,
-      x: points.filter((p)=>p.c===c).map((p)=>p.t),
-      y: points.filter((p)=>p.c===c).map((p)=>p.v)
-    }));
-
-    const layout = {
-      title: `${metric} (${gran})`,
-      paper_bgcolor:"rgba(0,0,0,0)",
-      plot_bgcolor:"rgba(0,0,0,0)",
-      font:{color:"#e9edf7"},
-      margin:{l:60,r:20,t:60,b:60},
-      xaxis:{title:"Tiempo"},
-      yaxis:{title: metric}
-    };
-
-    Plotly.react("ts_plot", traces, layout, {responsive:true});
-  };
-
-  // ============================
-  // TAB 2: Service level (ECDF)
-  // ============================
-  const buildDemandSeries = (rows, unit) => {
-    const xs = [];
-    if (unit === "Registro") {
-      rows.forEach((r)=>{
-        if (isFinite(r.correlativos)) xs.push(Number(r.correlativos));
-      });
-      return xs;
-    }
-    if (unit === "Día (máximo)") {
-      const m = new Map();
-      rows.forEach((r)=>{
-        const f = r.fecha;
-        if (!f || !isFinite(r.correlativos)) return;
-        const v = Number(r.correlativos);
-        m.set(f, Math.max(m.get(f) || -Infinity, v));
-      });
-      return [...m.values()].filter((v)=>isFinite(v));
-    }
-    // Día+Turno
-    const m = new Map();
-    rows.forEach((r)=>{
-      const f = r.fecha;
-      const h = r.horario_turno || "";
-      if (!f || !isFinite(r.correlativos)) return;
-      const k = `${f}||${h}`;
-      const v = Number(r.correlativos);
-      m.set(k, Math.max(m.get(k) || -Infinity, v));
-    });
-    return [...m.values()].filter((v)=>isFinite(v));
-  };
-
-  const renderService = (rows) => {
-    const ruta = document.getElementById("svc_ruta").value;
-    const dir = document.getElementById("svc_dir").value;
-    const unit = document.getElementById("svc_unit").value;
-    const levels = getMulti(document.getElementById("svc_levels")).map((x)=>Number(x)).filter((x)=>isFinite(x)).sort((a,b)=>a-b);
-
-    let base = rows.slice();
-    if (ruta !== "__ALL__") base = base.filter((r)=>String(r.ruta)===String(ruta));
-    if (dir !== "Ambos") base = base.filter((r)=> r.ie_norm === (dir==="Ingreso" ? "ingreso" : "egreso"));
-
-    const s = buildDemandSeries(base, unit);
-    if (!s.length) {
-      document.getElementById("svc_table").innerHTML = "<div class='muted'>Sin demanda válida</div>";
-      Plotly.react("svc_ecdf", [], {paper_bgcolor:"rgba(0,0,0,0)",plot_bgcolor:"rgba(0,0,0,0)",font:{color:"#e9edf7"}});
-      return;
-    }
-
-    const rec = levels.map((p)=>({
-      nivel_servicio_objetivo: `${Math.round(p*100)}%`,
-      capacidad_minima_recomendada: Math.ceil(quantile(s, p))
-    }));
-
-    document.getElementById("svc_table").innerHTML = renderTable(rec, ["nivel_servicio_objetivo", "capacidad_minima_recomendada"]);
-
-    const sMin = Math.floor(Math.min(...s));
-    const sMax = Math.ceil(Math.max(...s));
-    const capTest = document.getElementById("svc_cap_test");
-    capTest.min = String(Math.max(0, sMin));
-    capTest.max = String(Math.max(Math.max(1, sMin+1), sMax));
-    const p95 = Math.ceil(quantile(s, 0.95));
-    capTest.value = String(Math.min(Number(capTest.max), Math.max(Number(capTest.min), p95)));
-
-    const calcAndRender = () => {
-      const C = Number(capTest.value);
-      const ach = (s.filter((x)=>x<=C).length / s.length) * 100;
-      const over = s.filter((x)=>x>C).length;
-      document.getElementById("svc_ach").textContent = `${ach.toFixed(1)}%`;
-      document.getElementById("svc_over").textContent = over.toLocaleString("es-GT");
-
-      const xs = s.slice().sort((a,b)=>a-b);
-      const ys = xs.map((_,i)=>(i+1)/xs.length);
-
-      const shapes = [];
-      const ann = [];
-
-      levels.forEach((p)=>{
-        const cap = Math.ceil(quantile(s, p));
-        shapes.push({type:"line", x0:cap,x1:cap,y0:0,y1:1, xref:"x",yref:"y", line:{dash:"dot", width:1}});
-        ann.push({x:cap, y:0.02, xref:"x", yref:"y", text:`P${Math.round(p*100)}=${cap}`, showarrow:false});
-      });
-
-      shapes.push({type:"line", x0:C,x1:C,y0:0,y1:1, xref:"x",yref:"y", line:{dash:"solid", width:2}});
-      ann.push({x:C, y:0.98, xref:"x", yref:"y", text:`C probada=${C}`, showarrow:false, yanchor:"top"});
-
-      const capDin = (ruta !== "__ALL__") ? DASH.cap_by_route[String(ruta)] : null;
-      if (capDin !== null && capDin !== undefined && isFinite(capDin)) {
-        shapes.push({type:"line", x0:capDin,x1:capDin,y0:0,y1:1, xref:"x",yref:"y", line:{dash:"dash", width:2}});
-        ann.push({x:capDin, y:0.90, xref:"x", yref:"y", text:`Cap. Dinamo=${Math.round(capDin)}`, showarrow:false, yanchor:"top"});
-      }
-
-      const traces = [{
-        type:"scatter",
-        mode:"lines",
-        name:"ECDF",
-        x: xs,
-        y: ys
-      }];
-
-      const layout = {
-        title: `ECDF — ${ruta} | ${dir} | ${unit}`,
-        paper_bgcolor:"rgba(0,0,0,0)",
-        plot_bgcolor:"rgba(0,0,0,0)",
-        font:{color:"#e9edf7"},
-        margin:{l:60,r:20,t:60,b:60},
-        xaxis:{title:"Capacidad / Demanda (correlativos)"},
-        yaxis:{title:"Acumulado (nivel de servicio)", range:[0,1]},
-        shapes,
-        annotations: ann
-      };
-
-      Plotly.react("svc_ecdf", traces, layout, {responsive:true});
-    };
-
-    capTest.oninput = () => calcAndRender();
-    calcAndRender();
-  };
-
-  // ============================
-  // TAB 3: Dinamo Precio (PM + merge + corr + cat + ΔR²)
-  // ============================
-  const buildPilotMetrics = (rows, minShare, minTotal, bucketMin) => {
-    // rp: route_norm + piloto => events
-    const rp = new Map();
-    const rt = new Map();
-
-    rows.forEach((r)=>{
-      const rn = r.ruta_norm || "";
-      const pn = (r.piloto || "").trim().toLowerCase();
-      if (!rn || !pn) return;
-      const k = `${rn}||${pn}`;
-      rp.set(k, (rp.get(k) || 0) + 1);
-      rt.set(rn, (rt.get(rn) || 0) + 1);
-    });
-
-    // share + significant
-    const sig = new Map(); // route||pilot => bool
-    const pilotSetByRoute = new Map();
-    const topShare = new Map();
-    rp.forEach((cnt, k)=>{
-      const [rn,pn] = k.split("||");
-      const tot = rt.get(rn) || 0;
-      const share = tot ? cnt/tot : 0;
-      const isSig = (share >= minShare) && (cnt >= minTotal);
-      sig.set(k, isSig);
-
-      if (!pilotSetByRoute.has(rn)) pilotSetByRoute.set(rn, new Set());
-      pilotSetByRoute.get(rn).add(pn);
-
-      topShare.set(rn, Math.max(topShare.get(rn) || 0, share));
-    });
-
-    const pilotsTotal = new Map();
-    pilotSetByRoute.forEach((s, rn)=>pilotsTotal.set(rn, s.size));
-
-    const pilotsSig = new Map();
-    sig.forEach((isSig, k)=>{
-      if (!isSig) return;
-      const [rn,_] = k.split("||");
-      pilotsSig.set(rn, (pilotsSig.get(rn) || 0) + 1);
-    });
-
-    // bucket: route_norm + fecha + horario + piloto => count
-    const bucket = new Map();
-    rows.forEach((r)=>{
-      const rn = r.ruta_norm || "";
-      const f = r.fecha || "";
-      const h = (r.horario_turno || "").trim().toLowerCase();
-      const pn = (r.piloto || "").trim().toLowerCase();
-      if (!rn || !f || !pn) return;
-      const k = `${rn}||${f}||${h}||${pn}`;
-      bucket.set(k, (bucket.get(k) || 0) + 1);
-    });
-
-    // keep bucket_events >= bucketMin
-    const bucket2 = [];
-    bucket.forEach((cnt, k)=>{
-      if (cnt < bucketMin) return;
-      const [rn,f,h,pn] = k.split("||");
-      const isSig = sig.get(`${rn}||${pn}`) || false;
-      bucket2.push({rn,f,h,pn,isSig});
-    });
-
-    // per (rn,f,h): pilots_in_bucket + sig_pilots_in_bucket
-    const bf = new Map();
-    bucket2.forEach((b)=>{
-      const k = `${b.rn}||${b.f}||${b.h}`;
-      if (!bf.has(k)) bf.set(k, {pilots:new Set(), sig:0});
-      const o = bf.get(k);
-      o.pilots.add(b.pn);
-    });
-
-    // sig count: need unique significant pilots per bucket
-    const bfs = new Map();
-    bucket2.forEach((b)=>{
-      if (!b.isSig) return;
-      const k = `${b.rn}||${b.f}||${b.h}`;
-      if (!bfs.has(k)) bfs.set(k, new Set());
-      bfs.get(k).add(b.pn);
-    });
-
-    // per route aggregate
-    const bucketsCount = new Map();
-    const sumPilots = new Map();
-    const pct2plus = new Map();      // counts
-    const pct2plusSig = new Map();   // counts
-
-    bf.forEach((o, k)=>{
-      const [rn] = k.split("||");
-      const pilotsN = o.pilots.size;
-      const sigN = (bfs.get(k) ? bfs.get(k).size : 0);
-
-      bucketsCount.set(rn, (bucketsCount.get(rn) || 0) + 1);
-      sumPilots.set(rn, (sumPilots.get(rn) || 0) + pilotsN);
-      pct2plus.set(rn, (pct2plus.get(rn) || 0) + (pilotsN >= 2 ? 1 : 0));
-      pct2plusSig.set(rn, (pct2plusSig.get(rn) || 0) + (sigN >= 2 ? 1 : 0));
-    });
-
-    const pm = new Map();
-    [...rt.keys()].forEach((rn)=>{
-      const bN = bucketsCount.get(rn) || 0;
-      pm.set(rn, {
-        pilots_total: pilotsTotal.get(rn) || 0,
-        pilots_significant: pilotsSig.get(rn) || 0,
-        pilot_top_share: topShare.get(rn) || 0,
-        buckets: bN || null,
-        avg_pilots_per_bucket: bN ? (sumPilots.get(rn) || 0) / bN : null,
-        pct_buckets_2plus_pilots: bN ? ((pct2plus.get(rn) || 0)/bN)*100 : null,
-        pct_buckets_2plus_sig_pilots: bN ? ((pct2plusSig.get(rn) || 0)/bN)*100 : null
-      });
-    });
-
-    // demanda stats por ruta_norm
-    const demByRoute = new Map();
-    rows.forEach((r)=>{
-      const rn = r.ruta_norm || "";
-      if (!rn || !isFinite(r.correlativos)) return;
-      if (!demByRoute.has(rn)) demByRoute.set(rn, []);
-      demByRoute.get(rn).push(Number(r.correlativos));
-    });
-
-    demByRoute.forEach((arr, rn)=>{
-      const p50 = quantile(arr, 0.50);
-      const p90 = quantile(arr, 0.90);
-      const p95 = quantile(arr, 0.95);
-      const mean = arr.reduce((a,b)=>a+b,0)/arr.length;
-      const mov = arr.length;
-      const cur = pm.get(rn) || {};
-      pm.set(rn, {...cur, demanda_p50:p50, demanda_p90:p90, demanda_p95:p95, demanda_mean:mean, mov});
-    });
-
-    return pm; // Map route_norm -> metrics
-  };
-
-  const mergeDinamo = (pm, joinMode) => {
-    const keyPm = new Map();
-    // pm está por ruta_norm; para modos con sede/jornada, usamos “lo disponible” => se pega por ruta y listo
-    pm.forEach((v, rn)=> keyPm.set(rn, v));
-
-    const merged = DASH.dinamo.map((d)=>{
-      const rn = d.ruta_norm || "";
-      const m = keyPm.get(rn) || {};
-      return {...d, ...m};
-    }).filter((r)=> r.precio_q !== null && isFinite(r.precio_q));
-
-    return merged;
-  };
-
-  const renderPriceTab = (eventsFiltered) => {
-    const joinMode = document.getElementById("p_join").value;
-    const corrMethod = document.getElementById("p_corr").value;
-    const minShare = Number(document.getElementById("p_min_share").value || 0.15);
-    const minTotal = Number(document.getElementById("p_min_total").value || 30);
-    const bucketMin = Number(document.getElementById("p_bucket_min").value || 2);
-
-    const pm = buildPilotMetrics(eventsFiltered, minShare, minTotal, bucketMin);
-    const merged = mergeDinamo(pm, joinMode);
-
-    // --- 1) corr numérica vs precio
-    const numericVars = ["km","tiempo_min","capacidad","dias","pilots_total","pilots_significant","pilot_top_share",
-                         "avg_pilots_per_bucket","pct_buckets_2plus_sig_pilots","demanda_p95","demanda_mean"].filter((c)=> merged.some((r)=> isFinite(r[c])));
-
-    const corrRows = numericVars.map((v)=>{
-      const xs = [];
-      const ys = [];
-      merged.forEach((r)=>{
-        const x = r[v];
-        const y = r.precio_q;
-        if (isFinite(x) && isFinite(y)) { xs.push(Number(x)); ys.push(Number(y)); }
-      });
-      const c = (corrMethod==="pearson") ? corrPearson(xs, ys) : corrSpearman(xs, ys);
-      return {variable:v, [`corr_${corrMethod}`]:(c===null ? null : Number(c.toFixed(4))), n: xs.length};
-    }).sort((a,b)=> Math.abs(b[`corr_${corrMethod}`]||0) - Math.abs(a[`corr_${corrMethod}`]||0));
-
-    document.getElementById("p_corr_tbl").innerHTML = renderTable(corrRows, ["variable", `corr_${corrMethod}`, "n"]);
-
-    // --- 2) categórica box
-    const cat = document.getElementById("p_cat").value;
-    const catKey = (cat==="Jornada") ? "jornada" : "bus_tipo";
-    const byCat = new Map();
-    merged.forEach((r)=>{
-      const k = (r[catKey] || "—");
-      const y = r.precio_q;
-      if (!isFinite(y)) return;
-      if (!byCat.has(k)) byCat.set(k, []);
-      byCat.get(k).push(Number(y));
-    });
-    const cats = [...byCat.keys()].sort((a,b)=> String(a).localeCompare(String(b)));
-    const traces = cats.map((k)=>({type:"box", name:k, y:byCat.get(k), boxpoints:"outliers"}));
-    Plotly.react("p_cat_plot", traces, {
-      title:`Precio por ${cat}`,
-      paper_bgcolor:"rgba(0,0,0,0)",
-      plot_bgcolor:"rgba(0,0,0,0)",
-      font:{color:"#e9edf7"},
-      margin:{l:60,r:20,t:60,b:80},
-      xaxis:{title:cat},
-      yaxis:{title:"Precio Q (Diario)"}
-    }, {responsive:true});
-
-    const stats = cats.map((k)=>{
-      const arr = byCat.get(k).slice().sort((a,b)=>a-b);
-      const n = arr.length;
-      const mean = arr.reduce((a,b)=>a+b,0)/n;
-      const med = arr[Math.floor(n/2)];
-      const min = arr[0], max = arr[n-1];
-      const std = Math.sqrt(arr.reduce((a,b)=>a+(b-mean)*(b-mean),0)/Math.max(1,n-1));
-      return {[cat]:k, n, mean:mean.toFixed(2), median:med.toFixed(2), std:std.toFixed(2), min:min.toFixed(2), max:max.toFixed(2)};
-    }).sort((a,b)=> Number(b.mean) - Number(a.mean));
-
-    document.getElementById("p_cat_tbl").innerHTML = renderTable(stats, [cat,"n","mean","median","std","min","max"]);
-
-    // --- 3) ΔR² waterfall (OLS con mathjs)
-    const sampleMax = 3500;
-    const data = (merged.length > sampleMax) ? merged.slice(0, sampleMax) : merged.slice();
-
-    // features default
-    const feats = ["dias","km","tiempo_min","demanda_p95","pilots_total"].filter((c)=> numericVars.includes(c));
-    const blocks = feats.map((c)=>({name:c, mat: data.map((r)=>[ isFinite(r[c]) ? Number(r[c]) : 0 ])}));
-
-    // dummies (jornada + bus) si existen
-    const addDummies = (key, prefix) => {
-      const vals = uniqSorted(data.map((r)=>(r[key] || "")));
-      if (vals.length <= 1) return null;
-      const base = vals[0];
-      const cols = vals.slice(1);
-      const mat = data.map((r)=>{
-        const v = (r[key] || "");
-        return cols.map((c)=> (v===c ? 1 : 0));
-      });
-      // ✅ mostrar nombre ORIGINAL (no "dummies")
-      return {name:`${prefix}`, mat};
-    };
-
-    const jd = addDummies("jornada","Jornada");
-    const bd = addDummies("bus_tipo","Tipo de bus");
-    if (jd) blocks.push(jd);
-    if (bd) blocks.push(bd);
-
-    const yAll = data.map((r)=>Number(r.precio_q));
-
-    const fitR2 = (mats) => {
-      const n = data.length;
-      const X = [];
-      for (let i=0;i<n;i++){
-        const row = [1];
-        mats.forEach((mat)=>{
-          row.push(...mat[i]);
-        });
-        X.push(row);
-      }
-      const yv = yAll.map((v)=> (isFinite(v) ? v : 0));
-
-      const Xm = math.matrix(X);
-      const ym = math.matrix(yv);
-
-      const Xt = math.transpose(Xm);
-      const XtX = math.multiply(Xt, Xm);
-      const Xty = math.multiply(Xt, ym);
-      const beta = math.lusolve(XtX, Xty);
-
-      const yhat = math.multiply(Xm, beta).toArray().map((v)=>Array.isArray(v)?v[0]:v);
-      const ymean = yv.reduce((a,b)=>a+b,0)/yv.length;
-
-      let ssRes = 0, ssTot = 0;
-      for (let i=0;i<yv.length;i++){
-        ssRes += (yv[i]-yhat[i])*(yv[i]-yhat[i]);
-        ssTot += (yv[i]-ymean)*(yv[i]-ymean);
-      }
-      if (!isFinite(ssTot) || ssTot===0) return null;
-      return 1 - (ssRes/ssTot);
-    };
-
-    const r2Vals = [];
-    const deltas = [];
-    const matsSoFar = [];
-    let prev = 0;
-
-    blocks.forEach((b)=>{
-      matsSoFar.push(b.mat);
-      const r2 = fitR2(matsSoFar);
-      const r2v = (r2===null ? 0 : r2);
-      const d = r2v - prev;
-      r2Vals.push(r2v);
-      deltas.push(d);
-      prev = r2v;
-    });
-
-    const totalR2 = prev;
-
-    const wfTrace = [{
-      type:"waterfall",
-      x: ["R² inicial"].concat(blocks.map((b)=>b.name)).concat(["R² total"]),
-      y: [0].concat(deltas).concat([0]),
-      measure: ["absolute"].concat(deltas.map(()=> "relative")).concat(["total"])
-    }];
-
-    Plotly.react("p_r2_plot", wfTrace, {
-      title:`Cascada (ΔR²) — R² total ≈ ${totalR2.toFixed(3)}`,
-      paper_bgcolor:"rgba(0,0,0,0)",
-      plot_bgcolor:"rgba(0,0,0,0)",
-      font:{color:"#e9edf7"},
-      margin:{l:60,r:20,t:60,b:80},
-      xaxis:{title:"Variable / Bloque"},
-      yaxis:{title:"ΔR²"}
-    }, {responsive:true});
-
-    const r2Tbl = blocks.map((b,i)=>({bloque:b.name, delta_R2:Number(deltas[i].toFixed(4)), R2_acumulado:Number(r2Vals[i].toFixed(4))}))
-      .sort((a,b)=> Math.abs(b.delta_R2) - Math.abs(a.delta_R2));
-
-    document.getElementById("p_r2_tbl").innerHTML = renderTable(r2Tbl, ["bloque","delta_R2","R2_acumulado"]);
-  };
-
-  // ============================
-  // Wiring / bootstrap
-  // ============================
-  const initUI = () => {
-    // tabs
-    document.querySelectorAll(".tabbtn").forEach((b)=>{
-      b.addEventListener("click", ()=>{
-        document.querySelectorAll(".tabbtn").forEach((x)=>x.classList.remove("active"));
-        document.querySelectorAll(".tab").forEach((x)=>x.classList.remove("active"));
-        b.classList.add("active");
-        document.getElementById(b.dataset.tab).classList.add("active");
-      });
-    });
-
-    // populate filter options from raw events
-    const all = DASH.events;
-
-    const minD = uniqSorted(all.map((r)=>parseDateOnly(r.inicio_dt))).slice(0,1)[0] || null;
-    const maxD = uniqSorted(all.map((r)=>parseDateOnly(r.inicio_dt))).slice(-1)[0] || null;
-
-    els.f_date0.value = minD || "";
-    els.f_date1.value = maxD || "";
-
-    setOptions(els.f_corr, uniqSorted(all.map((r)=>r.corredor_desc)));
-    setOptions(els.f_sede, uniqSorted(all.map((r)=>r.sede)));
-    setOptions(els.f_ruta, uniqSorted(all.map((r)=>r.ruta)), {includeAll:true, allLabel:"Todas"});
-    setOptions(els.f_jornada, uniqSorted(all.map((r)=>r.jornada)));
-    setOptions(els.f_piloto, uniqSorted(all.map((r)=>r.piloto)));
-    setOptions(els.f_ie, uniqSorted(all.map((r)=>r.ie_norm)));
-
-    // local selects
-    setOptions(document.getElementById("box_ruta"), uniqSorted(all.map((r)=>r.ruta)), {includeAll:true, allLabel:"Todas"});
-    setOptions(document.getElementById("box_jornadas"), uniqSorted(all.map((r)=>r.jornada)));
-    setOptions(document.getElementById("wf_jornadas"), uniqSorted(all.map((r)=>r.jornada)));
-    setOptions(document.getElementById("svc_ruta"), uniqSorted(all.map((r)=>r.ruta)), {includeAll:true, allLabel:"Todas"});
-
-    // load initial from streamlit if viene
-    const ini = DASH.init || {};
-    if (ini.date_range && Array.isArray(ini.date_range) && ini.date_range.length===2) {
-      els.f_date0.value = ini.date_range[0] || els.f_date0.value;
-      els.f_date1.value = ini.date_range[1] || els.f_date1.value;
-    }
-    if (ini.corredor_sel && ini.corredor_sel.length) {
-      [...els.f_corr.options].forEach((o)=>o.selected = ini.corredor_sel.includes(o.value));
-    }
-    if (ini.sede_sel && ini.sede_sel.length) {
-      [...els.f_sede.options].forEach((o)=>o.selected = ini.sede_sel.includes(o.value));
-    }
-    if (ini.ruta_sel && ini.ruta_sel.length===1) {
-      els.f_ruta.value = ini.ruta_sel[0];
-    } else {
-      els.f_ruta.value = "__ALL__";
-    }
-    if (ini.jornada_sel && ini.jornada_sel.length) {
-      [...els.f_jornada.options].forEach((o)=>o.selected = ini.jornada_sel.includes(o.value));
-    }
-    if (ini.piloto_sel && ini.piloto_sel.length) {
-      [...els.f_piloto.options].forEach((o)=>o.selected = ini.piloto_sel.includes(o.value));
-    }
-
-    const onGlobalChange = () => {
-      state.global.date0 = els.f_date0.value || null;
-      state.global.date1 = els.f_date1.value || null;
-      state.global.corr = getMulti(els.f_corr);
-      state.global.sede = getMulti(els.f_sede);
-      state.global.ruta = els.f_ruta.value || "__ALL__";
-      state.global.jornada = getMulti(els.f_jornada);
-      state.global.piloto = getMulti(els.f_piloto);
-      state.global.ie = getMulti(els.f_ie);
-
-      const filtered = applyGlobal(DASH.events);
-
-      // render all
-      renderKPI(filtered);
-      renderBoxplot(filtered);
-      renderWaterfalls(filtered);
-      renderTimeseries(filtered);
-      renderService(filtered);
-      renderPriceTab(filtered);
-    };
-
-    // bind all relevant controls
-    [els.f_date0, els.f_date1, els.f_corr, els.f_sede, els.f_ruta, els.f_jornada, els.f_piloto, els.f_ie].forEach((x)=>x.addEventListener("change", onGlobalChange));
-    ["box_group","box_metric","box_ruta","box_jornadas","box_dir"].forEach((id)=>document.getElementById(id).addEventListener("change", onGlobalChange));
-    ["wf_group","wf_measure","wf_max","wf_dir","wf_jornadas"].forEach((id)=>document.getElementById(id).addEventListener("change", onGlobalChange));
-    ["ts_gran","ts_metric","ts_split"].forEach((id)=>document.getElementById(id).addEventListener("change", onGlobalChange));
-    ["svc_ruta","svc_dir","svc_unit","svc_levels"].forEach((id)=>document.getElementById(id).addEventListener("change", onGlobalChange));
-    ["p_join","p_corr","p_min_share","p_min_total","p_bucket_min","p_cat"].forEach((id)=>document.getElementById(id).addEventListener("change", onGlobalChange));
-
-    onGlobalChange();
-  };
-
-  initUI();
-</script>
-</body>
-</html>
-"""
-
-# =========================
-# Config
-# =========================
-st.set_page_config(page_title="Rutas - Optimización de Capacidad", layout="wide")
-
-SPANISH_WEEKDAY_ORDER = ["Lunes", "Martes", "Miércoles", "Jueves", "Viernes", "Sábado", "Domingo"]
-WEEKDAY_MAP_ES = {
-    "Monday": "Lunes",
-    "Tuesday": "Martes",
-    "Wednesday": "Miércoles",
-    "Thursday": "Jueves",
-    "Friday": "Viernes",
-    "Saturday": "Sábado",
-    "Sunday": "Domingo",
+TURN_COL = "Horario de turno"
+DT_COL   = "Momento de inicio"
+HOUR_COL = "Hora de inicio (hora)"
+PAX_COL  = "Pasajeros"
+
+TURN_BINS   = [0, 8, 16, 24]
+TURN_LABELS = ["Amanecer", "Dia", "Tarde"]
+TURN_MAP = {
+    "amanecer": "Amanecer",
+    "amanece": "Amanecer",
+    "dia": "Dia", "día": "Dia", "diurno": "Dia",
+    "tarde": "Tarde", "vespertino": "Tarde",
 }
 
-DEFAULT_COMMON_ROUTES_TEXT = """SM02\tSM03
-SM04\tSM06
-SG01\tSG05
-SG04\tSG06
-MFA1\tMFA2
-MFA3\tMFA1
-"""
+UBER_COL = "Precio Uber"
+UBER_SEATS_DEFAULT = 4
 
-
-@dataclass
-class ParsedData:
-    resumen: pd.DataFrame
-    dinamo: Optional[pd.DataFrame]
-    warnings: List[str]
-
-
-# =========================
-# Text utils (normalización para joins robustos)
-# =========================
-def norm_text(x: object) -> str:
-    if pd.isna(x):
-        return ""
-    s = str(x).strip()
-    s = re.sub(r"\s+", " ", s)
-    s = "".join(ch for ch in unicodedata.normalize("NFKD", s) if not unicodedata.combining(ch))
-    return s.lower().strip()
-
-
-def norm_jornada(x: object) -> str:
-    s = norm_text(x)
-    if s in {"ordinario", "ordinaria"}:
-        return "ordinario"
-    if s == "turno":
-        return "turno"
-    return s
-
-
-def parse_money_like(x: object) -> float:
-    if pd.isna(x):
-        return np.nan
-    s = str(x)
-    s = s.replace("Q", "").replace("q", "")
-    s = s.replace(",", "")
-    s = s.strip()
-    try:
-        return float(s)
-    except Exception:
-        return np.nan
+SCENARIOS_DEFAULT = {
+    "timid": {
+        "target_cov": 0.90,
+        "slack": 0.02,
+        "max_step_drop": 1,
+    },
+    "aggressive": {
+        "target_cov": 0.80,
+        "slack": 0.06,
+        "max_step_drop": 3,
+    }
+}
 
 
 # =========================
-# Parsing helpers (resumen)
+# Helpers
 # =========================
-def _parse_percent_series(s: pd.Series) -> pd.Series:
-    def to_float(x):
-        if pd.isna(x):
-            return np.nan
-        if isinstance(x, str):
-            x = x.strip()
-            if x.endswith("%"):
-                x = x[:-1].strip()
-                try:
-                    return float(x) / 100.0
-                except Exception:
-                    return np.nan
-            try:
-                return float(x)
-            except Exception:
-                return np.nan
-        try:
-            return float(x)
-        except Exception:
-            return np.nan
+def _safe_num(s):
+    if isinstance(s, pd.Series):
+        x = s.astype("string")
+    else:
+        x = pd.Series(s, dtype="string")
+    x = x.str.replace(",", "", regex=False)
+    x = x.str.replace(r"[^\d\.\-]", "", regex=True)
+    return pd.to_numeric(x, errors="coerce")
 
-    out = s.apply(to_float)
-    # si viniera 48 en lugar de 0.48, lo interpretamos como %
-    out = out.where(out <= 1.0, out / 100.0)
-    # ✅ CAP 0–100%
-    out = out.clip(lower=0.0, upper=1.0)
+
+def _winsor_upper_arr(x: np.ndarray, p: float):
+    x = np.asarray(x, dtype=float)
+    x = x[np.isfinite(x)]
+    if x.size < 5:
+        return x
+    hi = np.quantile(x, p)
+    return np.clip(x, None, hi)
+
+
+def _winsor_upper_series(s: pd.Series, p: float):
+    s = pd.to_numeric(s, errors="coerce")
+    if s.dropna().shape[0] < 5:
+        return s
+    hi = s.quantile(p)
+    return s.clip(upper=hi)
+
+
+def _coverage_unused(pax: np.ndarray, cap: int):
+    if cap is None or pd.isna(cap) or cap <= 0 or pax.size == 0:
+        return (np.nan, np.nan, np.nan)
+    cov = float((pax <= cap).mean())
+    unused = float(np.maximum(cap - pax, 0).mean())
+    unused_pct = float(unused / cap)
+    return cov, unused, unused_pct
+
+
+def _fmt_key(route, turno):
+    return f"{route} | {turno}"
+
+
+def _nearest_available(x, available_caps):
+    if pd.isna(x) or not available_caps:
+        return pd.NA
+    x = float(x)
+    return int(min(available_caps, key=lambda c: abs(c - x)))
+
+
+def _limit_step_drop(cap_actual, cap_candidate, available_caps, max_step_drop: int):
+    if max_step_drop is None or max_step_drop <= 0:
+        return cap_candidate
+    if pd.isna(cap_actual) or pd.isna(cap_candidate) or not available_caps:
+        return cap_candidate
+
+    caps = sorted(set(int(c) for c in available_caps))
+    ca = _nearest_available(cap_actual, caps)
+    cc = _nearest_available(cap_candidate, caps)
+    if pd.isna(ca) or pd.isna(cc) or ca not in caps or cc not in caps:
+        return cap_candidate
+
+    i = caps.index(ca)
+    min_allowed = caps[max(0, i - int(max_step_drop))]
+    return int(max(cc, min_allowed))
+
+
+def _pick_cap(arr, caps_try, target, slack):
+    if arr.size == 0:
+        return None, np.nan, np.nan
+
+    best = None
+    best_cov = None
+    best_unused = None
+
+    for c in caps_try:
+        cov, unused, _ = _coverage_unused(arr, c)
+        if np.isnan(cov):
+            continue
+        if cov >= target:
+            if (best is None) or (c < best) or (c == best and unused < best_unused):
+                best, best_cov, best_unused = c, cov, unused
+
+    if best is None:
+        soft_target = max(0.0, target - slack)
+        for c in caps_try:
+            cov, unused, _ = _coverage_unused(arr, c)
+            if np.isnan(cov):
+                continue
+            if cov >= soft_target:
+                if (best is None) or (c < best) or (c == best and unused < best_unused):
+                    best, best_cov, best_unused = c, cov, unused
+
+    if best is None:
+        best = None
+        best_cov = -1
+        best_unused = np.inf
+        for c in caps_try:
+            cov, unused, _ = _coverage_unused(arr, c)
+            if np.isnan(cov):
+                continue
+            if (cov > best_cov) or (cov == best_cov and (best is None or c < best)) or (cov == best_cov and c == best and unused < best_unused):
+                best, best_cov, best_unused = c, cov, unused
+
+    return best, float(best_cov), float(best_unused)
+
+
+def _normalize_turn_text(s: pd.Series) -> pd.Series:
+    s = s.astype("string").str.strip()
+    s = s.replace({"": pd.NA, "nan": pd.NA, "NaN": pd.NA, "None": pd.NA})
+    s_norm = s.str.lower().map(TURN_MAP)
+    s_keep = s.where(s.isin(TURN_LABELS), pd.NA)
+    return s_norm.fillna(s_keep)
+
+
+def _detect_ordinario(df: pd.DataFrame) -> pd.Series:
+    cols = [c for c in ["Jornada_x", "Jornada_y", "Jornada"] if c in df.columns]
+    if not cols:
+        return pd.Series(False, index=df.index)
+    s = pd.Series("", index=df.index, dtype="string")
+    for c in cols:
+        s = s.fillna("").astype("string") + " " + df[c].astype("string").fillna("")
+    s = s.str.strip().str.lower()
+    return s.str.contains("ordinario", na=False)
+
+
+def prepare_df(df: pd.DataFrame) -> pd.DataFrame:
+    d = df.copy()
+
+    d[DT_COL] = pd.to_datetime(d.get(DT_COL, pd.NaT), errors="coerce")
+
+    if HOUR_COL not in d.columns:
+        d[HOUR_COL] = d[DT_COL].dt.hour
+    d[HOUR_COL] = pd.to_numeric(d[HOUR_COL], errors="coerce").round()
+    d.loc[d[HOUR_COL] == 24, HOUR_COL] = 0
+    d.loc[(d[HOUR_COL] < 0) | (d[HOUR_COL] > 23), HOUR_COL] = np.nan
+
+    for c in [PAX_COL, "Capacidad", "# Días", "Precio Q (Diario)", UBER_COL, "Km", "Tiempo (minutos)"]:
+        if c in d.columns:
+            d[c] = _safe_num(d[c])
+
+    d["_is_ordinario"] = _detect_ordinario(d)
+
+    if TURN_COL not in d.columns:
+        d[TURN_COL] = pd.NA
+    d["_turn_raw_norm"] = _normalize_turn_text(d[TURN_COL])
+
+    turn_from_hour = pd.cut(
+        d[HOUR_COL],
+        bins=TURN_BINS,
+        labels=TURN_LABELS,
+        right=False,
+        include_lowest=True
+    ).astype("string")
+
+    obs = (d.loc[~d["_is_ordinario"]]
+             .dropna(subset=["Ruta", "_turn_raw_norm"])
+             .groupby("Ruta")["_turn_raw_norm"]
+             .agg(lambda s: set(s.dropna().unique().tolist())))
+    mode_by_route = (d.loc[~d["_is_ordinario"]]
+                       .dropna(subset=["Ruta", "_turn_raw_norm"])
+                       .groupby("Ruta")["_turn_raw_norm"]
+                       .agg(lambda s: s.mode().iloc[0] if len(s.mode()) else pd.NA))
+
+    d["_route_mode_turn"] = d["Ruta"].map(mode_by_route)
+
+    missing = d["_turn_raw_norm"].isna()
+    fill_hour = turn_from_hour
+    turn_nonord = d["_turn_raw_norm"].fillna(fill_hour).fillna(d["_route_mode_turn"]).fillna("TODOS")
+
+    d[TURN_COL] = np.where(d["_is_ordinario"], "Ordinario", turn_nonord)
+    d["_turn_imputed"] = (missing & ~d["_is_ordinario"] & d[TURN_COL].isin(TURN_LABELS))
+
+    d[PAX_COL] = _safe_num(d[PAX_COL])
+    d = d.dropna(subset=["Ruta", TURN_COL, DT_COL, PAX_COL]).copy()
+    d = d[d[PAX_COL] >= 0].copy()
+
+    return d.sort_values(DT_COL)
+
+
+def build_windows(d: pd.DataFrame, months_12m: int, recent_weeks: int, backtest_weeks: int):
+    tmax = d[DT_COL].max()
+    d12 = d[d[DT_COL] >= (tmax - pd.DateOffset(months=months_12m))].copy()
+    dR  = d12[d12[DT_COL] >= (tmax - pd.Timedelta(days=7*recent_weeks))].copy()
+    dBT = d12[d12[DT_COL] >= (tmax - pd.Timedelta(days=7*backtest_weeks))].copy()
+    return tmax, d12, dR, dBT
+
+
+def get_groups(d12: pd.DataFrame):
+    grp_df = (d12[["Ruta", TURN_COL]]
+              .dropna()
+              .drop_duplicates()
+              .sort_values(["Ruta", TURN_COL])
+              .reset_index(drop=True))
+    return pd.MultiIndex.from_frame(grp_df, names=["Ruta", TURN_COL])
+
+
+def get_avail_caps_and_actual(d12: pd.DataFrame, avail_caps_fixed):
+    avail_caps = list(avail_caps_fixed)
+
+    groups = get_groups(d12)
+
+    if "Capacidad" in d12.columns:
+        cap_actual = (d12.groupby(["Ruta", TURN_COL])["Capacidad"].mean().round().astype("Int64").reindex(groups))
+    else:
+        cap_actual = pd.Series(index=groups, dtype="Int64")
+
+    if "# Días" in d12.columns:
+        dias_contract = (d12.groupby(["Ruta", TURN_COL])["# Días"].mean().reindex(groups))
+    else:
+        dias_contract = pd.Series(index=groups, dtype="float64")
+
+    dias_contract = pd.to_numeric(dias_contract, errors="coerce").fillna(30).clip(lower=0)
+
+    return avail_caps, cap_actual, dias_contract
+
+
+def pooled_eval_samples(d12, dR, dBT, route, turno):
+    out = {}
+    out["BT_group"] = dBT[(dBT["Ruta"] == route) & (dBT[TURN_COL] == turno)][PAX_COL].dropna().to_numpy()
+    out["R_group"]  = dR[(dR["Ruta"] == route) & (dR[TURN_COL] == turno)][PAX_COL].dropna().to_numpy()
+    out["12m_group"]= d12[(d12["Ruta"] == route) & (d12[TURN_COL] == turno)][PAX_COL].dropna().to_numpy()
+    out["BT_route"] = dBT[dBT["Ruta"] == route][PAX_COL].dropna().to_numpy()
+    out["12m_route"]= d12[d12["Ruta"] == route][PAX_COL].dropna().to_numpy()
+    out["12m_all"]  = d12[PAX_COL].dropna().to_numpy()
     return out
 
 
-def _coerce_datetime(s: pd.Series, dayfirst: bool) -> pd.Series:
-    return pd.to_datetime(s, errors="coerce", dayfirst=dayfirst, infer_datetime_format=True)
+def pick_eval_pool(pools: dict, min_eval_n: int, min_group_n: int):
+    order = ["BT_group","R_group","12m_group","BT_route","12m_route","12m_all"]
+
+    for src in ["BT_group","R_group","12m_group"]:
+        if pools[src].size >= min_group_n:
+            return src, pools[src]
+
+    for src in order:
+        if pools[src].size >= min_eval_n:
+            return src, pools[src]
+
+    src = max(order, key=lambda s: pools[s].size)
+    return src, pools[src]
 
 
-def parse_coef_text(text: str) -> dict:
-    """
-    Acepta líneas tipo:
-      feature<TAB>coef
-      feature  coef
-    Ej:
-      intercept    8213.80
-      bus_Mercedes Benz 4768.05
-    """
-    coef = {}
-    for raw in (text or "").splitlines():
-        line = raw.strip()
-        if not line:
-            continue
+def recommend_two_caps_for_group(arr, ca, avail_caps, timid_cfg, aggr_cfg, src, clip_p_eval: float):
+    caps = sorted(set(int(c) for c in avail_caps))
+    ca_int = int(ca)
 
-        # intenta split por tab, si no por espacios múltiples
-        if "\t" in line:
-            parts = [p.strip() for p in line.split("\t") if p.strip()]
-        else:
-            parts = re.split(r"\s{2,}|\s+(?=[-+]?\d+(\.\d+)?$)", line)
+    caps_try = [c for c in caps if c <= ca_int]
+    if not caps_try:
+        return ca_int, ca_int, np.nan, np.nan, "No hay cap menor disponible"
 
-        if len(parts) < 2:
-            continue
+    arr = _winsor_upper_arr(arr, clip_p_eval)
 
-        name = parts[0].strip()
-        try:
-            val = float(parts[-1])
-        except Exception:
-            continue
+    t_best, t_cov, _ = _pick_cap(arr, caps_try, timid_cfg["target_cov"], timid_cfg["slack"])
+    a_best, a_cov, _ = _pick_cap(arr, caps_try, aggr_cfg["target_cov"], aggr_cfg["slack"])
 
-        coef[name] = val
-    return coef
+    t_step = int(timid_cfg["max_step_drop"])
+    a_step = int(aggr_cfg["max_step_drop"])
 
+    if src in ("12m_all", "12m_route"):
+        a_step = min(a_step, 2)
+    if src == "12m_all":
+        a_step = 1
 
-def build_basic_contrib_row(row: pd.Series, coef: dict) -> tuple[float, pd.DataFrame, list[str]]:
-    """
-    Construye contribuciones usando:
-      - intercept como baseline
-      - numéricas: coef * valor_columna
-      - categóricas:
-          bus_<Tipo de bus> => 1 si coincide
-          jornada_<Jornada> => 1 si coincide
-    """
-    warnings = []
-    intercept = float(coef.get("intercept", 0.0))
+    cap_t = _limit_step_drop(ca_int, int(t_best), caps, t_step)
+    cap_a = _limit_step_drop(ca_int, int(a_best), caps, a_step)
 
-    contribs = []
+    cap_t = int(min(ca_int, cap_t))
+    cap_a = int(min(ca_int, cap_a))
 
-    # 1) variables numéricas: si el feature existe como columna exacta
-    for feat, b in coef.items():
-        if feat == "intercept":
-            continue
-        if feat.startswith("bus_") or feat.startswith("jornada_"):
-            continue
+    if cap_t in caps and cap_a in caps:
+        it = caps.index(cap_t)
+        ia = caps.index(cap_a)
+        if ia < it - 2:
+            cap_a = caps[max(0, it - 2)]
 
-        if feat in row.index:
-            x = row[feat]
-            x = pd.to_numeric(pd.Series([x]), errors="coerce").iloc[0]
-            if pd.isna(x):
-                warnings.append(f"'{feat}' está NaN → contrib=0")
-                x = 0.0
-            contribs.append((feat, float(b) * float(x), float(x), float(b)))
-        else:
-            # si no existe la columna, solo la ignoramos (sin reventar)
-            warnings.append(f"No encontré columna '{feat}' en la fila → se ignora")
+    cov_ca, _, unusedpct_ca = _coverage_unused(arr, ca_int)
+    if (cap_t == ca_int) and (unusedpct_ca >= 0.40):
+        idx = caps.index(_nearest_available(ca_int, caps))
+        if idx > 0:
+            c1 = caps[idx - 1]
+            cov1, _, _ = _coverage_unused(arr, c1)
+            if not np.isnan(cov1) and cov1 >= (timid_cfg["target_cov"] - 0.03):
+                cap_t = c1
 
-    # 2) categóricas: Tipo de bus
-    bus_type = str(row.get("Tipo de bus", "")).strip()
-    if bus_type:
-        key = f"bus_{bus_type}"
-        if key in coef:
-            b = float(coef[key])
-            contribs.append((key, b * 1.0, 1.0, b))
-        # si no existe coef para ese bus (p.ej. categoría base), contrib=0
-
-    # 3) categóricas: Jornada
-    jornada = str(row.get("Jornada", "")).strip()
-    if jornada:
-        key = f"jornada_{jornada}"
-        if key in coef:
-            b = float(coef[key])
-            contribs.append((key, b * 1.0, 1.0, b))
-
-    # tabla
-    dfc = pd.DataFrame(contribs, columns=["feature", "contrib_Q", "x", "coef"])
-    dfc = dfc.sort_values("contrib_Q", key=lambda s: s.abs(), ascending=False)
-
-    pred = intercept + dfc["contrib_Q"].sum() if not dfc.empty else intercept
-    return float(pred), dfc, warnings
+    return cap_t, cap_a, t_cov, a_cov, "OK"
 
 
-def plot_basic_waterfall(intercept: float, pred: float, contrib_df: pd.DataFrame, title: str):
-    # Waterfall: todas las contribuciones como relative, y un total al final.
-    labels = contrib_df["feature"].tolist() + ["Predicción"]
-    values = contrib_df["contrib_Q"].tolist() + [0]
-    measures = ["relative"] * len(contrib_df) + ["total"]
+def metrics_for_cap_series(d12, groups, cap_series):
+    rows = []
+    for (r,t) in groups:
+        pax = d12[(d12["Ruta"] == r) & (d12[TURN_COL] == t)][PAX_COL].dropna().to_numpy()
+        cap = cap_series.get((r,t), pd.NA)
+        cap_int = int(cap) if pd.notna(cap) else None
+        cov, unused, unused_pct = _coverage_unused(pax, cap_int) if cap_int else (np.nan, np.nan, np.nan)
+        exceed = np.nan if np.isnan(cov) else 1 - cov
+        rows.append((r,t,cov,exceed,unused,unused_pct))
+    return pd.DataFrame(rows, columns=["Ruta",TURN_COL,"coverage","exceed","unused_seats","unused_pct"]).set_index(["Ruta",TURN_COL])
 
-    fig = go.Figure(go.Waterfall(
-        x=labels,
-        y=values,
-        measure=measures
+
+def compute_viajes_dia_mean(d12: pd.DataFrame, groups: pd.MultiIndex) -> pd.Series:
+    daily_trips = (
+        d12.assign(fecha=d12[DT_COL].dt.date)
+           .groupby(["Ruta",TURN_COL,"fecha"]).size()
+           .reset_index(name="viajes_dia")
+    )
+    return daily_trips.groupby(["Ruta",TURN_COL])["viajes_dia"].mean().reindex(groups)
+
+
+def add_excess_costs(reco: pd.DataFrame, d12: pd.DataFrame, uber_seats: int) -> pd.DataFrame:
+    if UBER_COL not in d12.columns:
+        for p in ["actual","timid","aggressive"]:
+            for c in [f"excess_prob_{p}", f"excess_pax_mean_{p}",
+                      f"uber_rides_mean_{p}", f"excess_cost_trip_mean_{p}",
+                      f"excess_cost_day_{p}", f"excess_cost_month_{p}"]:
+                reco[c] = np.nan
+        return reco
+
+    dd = d12.copy()
+    dd[UBER_COL] = _safe_num(dd[UBER_COL])
+
+    groups_here = pd.MultiIndex.from_frame(reco[["Ruta",TURN_COL]])
+    viajes_dia_mean = compute_viajes_dia_mean(dd, groups_here)
+
+    if "dias_contract" not in reco.columns:
+        reco["dias_contract"] = 30.0
+    reco["dias_contract"] = pd.to_numeric(reco["dias_contract"], errors="coerce").fillna(30).clip(lower=0)
+
+    base = reco[["Ruta",TURN_COL,"dias_contract",
+                 "cap_actual","cap_reco_timid","cap_reco_aggressive"]].copy()
+
+    def _calc(prefix: str, cap_col: str):
+        tmp = dd.merge(
+            base[["Ruta",TURN_COL,cap_col]].rename(columns={cap_col:"cap"}),
+            on=["Ruta",TURN_COL], how="left"
+        )
+        tmp["cap"] = pd.to_numeric(tmp["cap"], errors="coerce")
+        tmp["pax"] = pd.to_numeric(tmp[PAX_COL], errors="coerce")
+
+        tmp["excess_pax"] = (tmp["pax"] - tmp["cap"]).clip(lower=0)
+        tmp["uber_rides"] = np.ceil(tmp["excess_pax"] / max(1, int(uber_seats))).fillna(0)
+        tmp["excess_cost"] = (tmp["uber_rides"] * tmp[UBER_COL]).fillna(0)
+        tmp["has_excess"] = tmp["excess_pax"] > 0
+
+        g = tmp.groupby(["Ruta",TURN_COL])
+        out = pd.DataFrame({
+            f"excess_prob_{prefix}": g["has_excess"].mean(),
+            f"excess_pax_mean_{prefix}": g["excess_pax"].mean(),
+            f"uber_rides_mean_{prefix}": g["uber_rides"].mean(),
+            f"excess_cost_trip_mean_{prefix}": g["excess_cost"].mean(),
+        }).reset_index()
+
+        out = out.merge(viajes_dia_mean.rename("viajes_dia").reset_index(), on=["Ruta",TURN_COL], how="left") \
+                 .merge(base[["Ruta",TURN_COL,"dias_contract"]], on=["Ruta",TURN_COL], how="left")
+
+        out[f"excess_cost_day_{prefix}"] = out[f"excess_cost_trip_mean_{prefix}"] * out["viajes_dia"].fillna(0)
+        out[f"excess_cost_month_{prefix}"] = out[f"excess_cost_day_{prefix}"] * out["dias_contract"].fillna(30)
+
+        return out.drop(columns=["viajes_dia","dias_contract"])
+
+    out_a = _calc("actual", "cap_actual")
+    out_t = _calc("timid", "cap_reco_timid")
+    out_g = _calc("aggressive", "cap_reco_aggressive")
+
+    reco2 = reco.merge(out_a, on=["Ruta",TURN_COL], how="left") \
+                .merge(out_t, on=["Ruta",TURN_COL], how="left") \
+                .merge(out_g, on=["Ruta",TURN_COL], how="left")
+    return reco2
+
+
+def build_pmf_figure(d12: pd.DataFrame, ruta: str, turno: str, cap0, capt, capa) -> go.Figure:
+    dd = d12.copy()
+    dd["pax_int"] = pd.to_numeric(dd[PAX_COL], errors="coerce").round().astype("Int64")
+    dr = dd[(dd["Ruta"]==ruta) & (dd[TURN_COL]==turno)].dropna(subset=["pax_int"])
+    pmf = dr["pax_int"].value_counts(normalize=True).sort_index()
+    x = pmf.index.astype(int).tolist()
+    y = pmf.values.tolist()
+    ymax = float(pmf.max()) if len(pmf) else 0.1
+    ymax = max(ymax * 1.20, 0.05)
+
+    fig = go.Figure()
+    fig.add_trace(go.Bar(
+        x=x, y=y, name="Probabilidad",
+        hovertemplate="P(X=%{x})=%{y:.2%}<extra></extra>"
     ))
+
+    def vline(cap, name, dash):
+        if pd.isna(cap):
+            return
+        c = int(cap)
+        fig.add_trace(go.Scatter(
+            x=[c, c], y=[0, ymax],
+            mode="lines", name=name,
+            line=dict(dash=dash),
+            hovertemplate=f"{name}=%{{x}}<extra></extra>"
+        ))
+
+    vline(cap0, "Actual", "dash")
+    vline(capt, "Timid", "dot")
+    vline(capa, "Aggressive", "dashdot")
+
     fig.update_layout(
-        title=f"{title} | baseline(intercept)={intercept:.2f} → pred={pred:.2f}",
-        xaxis_title="Variable",
-        yaxis_title="Aporte al Precio (Q)"
+        title=f"PMF — {ruta} | {turno}",
+        xaxis_title="Pasajeros (X)",
+        yaxis_title="Probabilidad P(X)",
+        yaxis=dict(range=[0, ymax]),
+        legend=dict(orientation="h", x=0, y=-0.25, xanchor="left", yanchor="top"),
+        margin=dict(t=80, b=90, r=30, l=30)
     )
     return fig
 
 
-@st.cache_data(show_spinner=False)
-def load_excel_sheets(file_bytes: bytes, sheet_resumen: str, sheet_dinamo: str, dayfirst: bool) -> ParsedData:
-    warnings: List[str] = []
+def build_box_month_figure(d12: pd.DataFrame, ruta: str, turno: str, cap0, capt, capa, min_n_mes: int) -> go.Figure:
+    dd = d12.copy()
+    dd[DT_COL] = pd.to_datetime(dd[DT_COL], errors="coerce")
+    dd["Mes"] = dd[DT_COL].dt.to_period("M").astype(str)
 
-    # --- Resumen ---
-    df = pd.read_excel(file_bytes, sheet_name=sheet_resumen, engine="openpyxl")
-    df.columns = [str(c).strip() for c in df.columns]
-
-    col_inicio = "hora de inicio"
-    col_fin = "hora de finalizacion"
-    col_date = "date"
-    col_pct = "% de ocupación"
-    col_ie = "Ingreso / Egreso"
-
-    # datetimes
-    if col_inicio in df.columns:
-        df["inicio_dt"] = _coerce_datetime(df[col_inicio], dayfirst=dayfirst)
-        if df["inicio_dt"].isna().mean() > 0.2:
-            warnings.append(f"Muchos valores no se pudieron parsear en '{col_inicio}'. Revisá formato/idioma.")
-    elif col_date in df.columns:
-        df["inicio_dt"] = _coerce_datetime(df[col_date], dayfirst=dayfirst)
-        warnings.append(f"No encontré '{col_inicio}'. Estoy usando '{col_date}' como inicio.")
+    dr = dd[(dd["Ruta"]==ruta) & (dd[TURN_COL]==turno)].copy()
+    cnt = dr.groupby("Mes")[PAX_COL].size()
+    months_ok = sorted(cnt[cnt >= min_n_mes].index.tolist())
+    if months_ok:
+        dr = dr[dr["Mes"].isin(months_ok)]
+        X = months_ok
     else:
-        df["inicio_dt"] = pd.NaT
-        warnings.append("No encontré 'hora de inicio' ni 'date' en resumen.")
+        X = sorted(dd["Mes"].dropna().unique().tolist())
 
-    if col_fin in df.columns:
-        df["fin_dt"] = _coerce_datetime(df[col_fin], dayfirst=dayfirst)
-    else:
-        df["fin_dt"] = pd.NaT
+    fig = go.Figure()
+    fig.add_trace(px.box(dr, x="Mes", y=PAX_COL, points=False).data[0])
+    fig.data[0].name = "Pasajeros"
 
-    df["duracion_s"] = (df["fin_dt"] - df["inicio_dt"]).dt.total_seconds()
-
-    # % ocupación
-    if col_pct in df.columns:
-        df["pct_ocup"] = _parse_percent_series(df[col_pct])
-    else:
-        df["pct_ocup"] = np.nan
-
-    # numéricos clave
-    for c in ["Cantidad de correlativos", "Ocupación máxima"]:
-        if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
-
-    # categoricos
-    for c in ["jornada", "ruta", "sede", "piloto", "horario de turno", col_ie]:
-        if c in df.columns:
-            df[c] = df[c].astype(str).fillna("").str.strip()
-
-    # normalizar Ingreso/Egreso
-    if col_ie in df.columns:
-        ie = df[col_ie].astype(str).str.strip().str.lower()
-        ie = np.where(ie.str.contains("egre"), "egreso",
-                      np.where(ie.str.contains("ingre"), "ingreso", ie))
-        df["ie_norm"] = ie
-    else:
-        df["ie_norm"] = ""
-
-    # derivados fecha
-    df["fecha"] = df["inicio_dt"].dt.date
-    df["mes_ym"] = df["inicio_dt"].dt.to_period("M").astype(str)
-    df["dow_en"] = df["inicio_dt"].dt.day_name()
-    df["dia_semana"] = pd.Categorical(df["dow_en"].map(WEEKDAY_MAP_ES), categories=SPANISH_WEEKDAY_ORDER, ordered=True)
-
-    # normalizadores para joins
-    df["ruta_norm"] = df["ruta"].map(norm_text) if "ruta" in df.columns else ""
-    df["sede_norm"] = df["sede"].map(norm_text) if "sede" in df.columns else ""
-    df["jornada_norm"] = df["jornada"].map(norm_jornada) if "jornada" in df.columns else ""
-
-    # --- Dinamo ---
-    dinamo = None
-    try:
-        d = pd.read_excel(file_bytes, sheet_name=sheet_dinamo, engine="openpyxl")
-        d.columns = [str(c).strip() for c in d.columns]
-
-        # normalizar nombres esperados
-        rename_map = {}
-        for col in d.columns:
-            n = norm_text(col)
-            if n == "precio q (diario)":
-                rename_map[col] = "Precio Q (Diario)"
-            if n in {"# dias", "# d ias", "dias"}:
-                rename_map[col] = "# Días"
-            if n == "tiempo (minutos)":
-                rename_map[col] = "Tiempo (minutos)"
-            if n in {"tipo de bus", "tipo bus", "tipodebus"}:
-                rename_map[col] = "Tipo de bus"
-        if rename_map:
-            d = d.rename(columns=rename_map)
-
-        # numéricos
-        if "Precio Q (Diario)" in d.columns:
-            d["Precio Q (Diario)"] = d["Precio Q (Diario)"].apply(parse_money_like)
-        for c in ["Capacidad", "# Días", "Tiempo (minutos)", "Km"]:
-            if c in d.columns:
-                d[c] = pd.to_numeric(d[c], errors="coerce")
-
-        # texto
-        for c in ["Sede", "Ruta", "Jornada", "Destino", "Tipo de bus"]:
-            if c in d.columns:
-                d[c] = d[c].astype(str).fillna("").str.strip()
-
-        # normalizadores para joins
-        d["ruta_norm"] = d["Ruta"].map(norm_text) if "Ruta" in d.columns else ""
-        d["sede_norm"] = d["Sede"].map(norm_text) if "Sede" in d.columns else ""
-        d["jornada_norm"] = d["Jornada"].map(norm_jornada) if "Jornada" in d.columns else ""
-
-        # normalizador de tipo de bus (para categorías limpias)
-        if "Tipo de bus" in d.columns:
-            d["bus_tipo_norm"] = d["Tipo de bus"].map(norm_text)
-
-        dinamo = d
-    except Exception as e:
-        warnings.append(f"No pude leer hoja '{sheet_dinamo}'. Error: {e}")
-
-    return ParsedData(resumen=df, dinamo=dinamo, warnings=warnings)
-
-
-# =========================
-# Corredores (rutas en común)
-# =========================
-def parse_edges_from_text(text: str) -> Tuple[List[Tuple[str, str]], List[str]]:
-    warnings: List[str] = []
-    edges: List[Tuple[str, str]] = []
-    if not text or not text.strip():
-        return edges, warnings
-
-    for i, raw in enumerate(text.splitlines(), start=1):
-        line = raw.strip()
-        if not line:
-            continue
-
-        if "\t" in line:
-            parts = [p.strip() for p in line.split("\t") if p.strip()]
-        elif "," in line:
-            parts = [p.strip() for p in line.split(",") if p.strip()]
-        else:
-            parts = [p.strip() for p in line.split() if p.strip()]
-
-        if len(parts) < 2:
-            warnings.append(f"Línea {i}: no pude leer par en '{raw}'.")
-            continue
-
-        a, b = parts[0], parts[1]
-        if a == b:
-            warnings.append(f"Línea {i}: '{a}' con '{b}' es el mismo; ignorado.")
-            continue
-
-        edges.append((a, b))
-
-    return edges, warnings
-
-
-def build_corridors_from_edges(edges: List[Tuple[str, str]]) -> List[Tuple[str, List[str]]]:
-    parent: Dict[str, str] = {}
-
-    def find(x: str) -> str:
-        parent.setdefault(x, x)
-        if parent[x] != x:
-            parent[x] = find(parent[x])
-        return parent[x]
-
-    def union(a: str, b: str):
-        ra, rb = find(a), find(b)
-        if ra != rb:
-            parent[rb] = ra
-
-    for a, b in edges:
-        union(a, b)
-
-    groups: Dict[str, set] = {}
-    for node in list(parent.keys()):
-        root = find(node)
-        groups.setdefault(root, set()).add(node)
-
-    members_sorted = sorted([sorted(list(s)) for s in groups.values()], key=lambda x: (-len(x), x))
-    corridors: List[Tuple[str, List[str]]] = []
-    for i, members in enumerate(members_sorted):
-        corridors.append((f"CORR-{i+1:03d}", members))
-    return corridors
-
-
-def assign_corridor(df: pd.DataFrame, edges: List[Tuple[str, str]], route_col: str = "ruta") -> Tuple[pd.DataFrame, List[Tuple[str, List[str]]]]:
-    corridors = build_corridors_from_edges(edges)
-    route_to_corr: Dict[str, str] = {}
-    for corr_id, routes in corridors:
-        for r in routes:
-            route_to_corr[str(r).strip()] = corr_id
-
-    out = df.copy()
-    if route_col not in out.columns:
-        out["corredor_id"] = "SIN_CORREDOR"
-        out["corredor_desc"] = "SIN_CORREDOR"
-        return out, corridors
-
-    out[route_col] = out[route_col].astype(str).str.strip()
-    out["corredor_id"] = out[route_col].map(route_to_corr).fillna("SIN_CORREDOR")
-
-    corr_desc = {cid: f"{cid} ({', '.join(routes)})" for cid, routes in corridors}
-    out["corredor_desc"] = out["corredor_id"].map(corr_desc).fillna("SIN_CORREDOR")
-    return out, corridors
-
-
-# =========================
-# Diagnóstico Ingreso/Egreso (solo reporta)
-# =========================
-def make_bus_key(df: pd.DataFrame, key_mode: str) -> pd.Series:
-    def col_or_empty(c):
-        return df[c].astype(str).fillna("").str.strip() if c in df.columns else ""
-
-    sede = col_or_empty("sede")
-    ruta = col_or_empty("ruta")
-    jornada = col_or_empty("jornada")
-    piloto = col_or_empty("piloto")
-
-    if key_mode == "sede+ruta":
-        return sede + " | " + ruta
-    if key_mode == "sede+ruta+jornada":
-        return sede + " | " + ruta + " | " + jornada
-    if key_mode == "sede+ruta+piloto":
-        return sede + " | " + ruta + " | " + piloto
-    return sede + " | " + ruta + " | " + jornada + " | " + piloto
-
-
-def pairing_quality(events_df: pd.DataFrame, key_mode: str) -> Dict[str, int]:
-    if events_df.empty or "ie_norm" not in events_df.columns or "inicio_dt" not in events_df.columns:
-        return {"orphan_egreso": 0, "consecutive_ingreso": 0, "open_ingreso_end": 0}
-
-    w = events_df.dropna(subset=["inicio_dt"]).copy()
-    w["bus_key"] = make_bus_key(w, key_mode=key_mode)
-    w = w.sort_values(["bus_key", "inicio_dt"])
-
-    open_ing: Dict[str, pd.Timestamp] = {}
-    orphan_eg = 0
-    consec_in = 0
-
-    for _, r in w.iterrows():
-        k = r["bus_key"]
-        ie = r["ie_norm"]
-
-        if ie == "ingreso":
-            if k in open_ing:
-                consec_in += 1
-            open_ing[k] = r["inicio_dt"]
-
-        elif ie == "egreso":
-            if k not in open_ing:
-                orphan_eg += 1
-            else:
-                open_ing.pop(k, None)
-
-    open_end = len(open_ing)
-    return {"orphan_egreso": orphan_eg, "consecutive_ingreso": consec_in, "open_ingreso_end": open_end}
-
-
-# =========================
-# Filtros globales
-# =========================
-@dataclass
-class FilterState:
-    date_range: Optional[Tuple]
-    corredor_sel: Optional[List[str]]
-    sede_sel: Optional[List[str]]
-    ruta_sel: Optional[List[str]]  # ahora será None o [una]
-    jornada_sel: Optional[List[str]]
-    piloto_sel: Optional[List[str]]
-    ie_sel: Optional[List[str]]
-
-
-def _multiselect_if_exists(df: pd.DataFrame, col: str, label: str, default: Optional[List[str]] = None):
-    if col not in df.columns:
-        return None
-    vals = sorted([v for v in df[col].dropna().unique().tolist() if str(v).strip() != ""])
-    if not vals:
-        return None
-    dflt = default or []
-    dflt = [x for x in dflt if x in vals]
-    return st.multiselect(label, vals, default=dflt)
-
-
-def _select_one_or_all(df: pd.DataFrame, col: str, label: str) -> Optional[List[str]]:
-    if col not in df.columns:
-        return None
-    vals = sorted([v for v in df[col].dropna().unique().tolist() if str(v).strip() != ""])
-    if not vals:
-        return None
-    choice = st.selectbox(label, ["Todas"] + vals, index=0)
-    if choice == "Todas":
-        return None
-    return [choice]
-
-
-def get_filters(events_df: pd.DataFrame) -> FilterState:
-    with st.sidebar:
-        st.header("Filtros (globales)")
-
-        min_dt = events_df["inicio_dt"].min() if "inicio_dt" in events_df.columns else pd.NaT
-        max_dt = events_df["inicio_dt"].max() if "inicio_dt" in events_df.columns else pd.NaT
-
-        date_range = None
-        if pd.notna(min_dt) and pd.notna(max_dt):
-            date_range = st.date_input(
-                "Rango de fechas",
-                value=(min_dt.date(), max_dt.date()),
-                min_value=min_dt.date(),
-                max_value=max_dt.date(),
-            )
-
-        corredor_sel = _multiselect_if_exists(events_df, "corredor_desc", "Corredor (rutas en común)")
-        sede_sel = _multiselect_if_exists(events_df, "sede", "Sede")
-
-        # ✅ RUTA: “una o todas” (no multiruta)
-        ruta_sel = _select_one_or_all(events_df, "ruta", "Ruta (una o todas)")
-
-        # ✅ JORNADA: multi + default SOLO Turno y (Ordinaria/Ordinario)
-        jornada_default = []
-        if "jornada" in events_df.columns:
-            jvals = sorted([v for v in events_df["jornada"].dropna().unique().tolist() if str(v).strip() != ""])
-            if "Turno" in jvals:
-                jornada_default.append("Turno")
-            # tu data puede traer Ordinaria u Ordinario
-            if "Ordinaria" in jvals:
-                jornada_default.append("Ordinaria")
-            elif "Ordinario" in jvals:
-                jornada_default.append("Ordinario")
-
-        jornada_sel = _multiselect_if_exists(events_df, "jornada", "Jornada", default=jornada_default)
-
-        piloto_sel = _multiselect_if_exists(events_df, "piloto", "Piloto")
-        ie_sel = _multiselect_if_exists(events_df, "Ingreso / Egreso", "Ingreso / Egreso")
-
-    return FilterState(
-        date_range=date_range,
-        corredor_sel=corredor_sel,
-        sede_sel=sede_sel,
-        ruta_sel=ruta_sel,
-        jornada_sel=jornada_sel,
-        piloto_sel=piloto_sel,
-        ie_sel=ie_sel,
-    )
-
-
-def apply_filters_events(df: pd.DataFrame, fs: FilterState) -> pd.DataFrame:
-    out = df.copy()
-
-    if fs.date_range and isinstance(fs.date_range, tuple) and len(fs.date_range) == 2 and "inicio_dt" in out.columns:
-        d0, d1 = fs.date_range
-        out = out[(out["inicio_dt"].dt.date >= d0) & (out["inicio_dt"].dt.date <= d1)]
-
-    def apply_multi(col: str, selected: Optional[List[str]]):
-        nonlocal out
-        if selected is not None and len(selected) > 0 and col in out.columns:
-            out = out[out[col].isin(selected)]
-
-    apply_multi("corredor_desc", fs.corredor_sel)
-    apply_multi("sede", fs.sede_sel)
-    apply_multi("ruta", fs.ruta_sel)
-    apply_multi("jornada", fs.jornada_sel)
-    apply_multi("piloto", fs.piloto_sel)
-    apply_multi("Ingreso / Egreso", fs.ie_sel)
-
-    return out
-
-
-# =========================
-# Demanda = Cantidad de correlativos (hard)
-# =========================
-def compute_demand(events_df: pd.DataFrame) -> pd.Series:
-    if "Cantidad de correlativos" not in events_df.columns:
-        return pd.Series([np.nan] * len(events_df), index=events_df.index)
-    return pd.to_numeric(events_df["Cantidad de correlativos"], errors="coerce")
-
-
-# =========================
-# KPI
-# =========================
-def kpi_row_events(df: pd.DataFrame):
-    c1, c2, c3, c4 = st.columns(4)
-
-    c1.metric("Movimientos (registros)", f"{len(df):,}".replace(",", " "))
-
-    if "ie_norm" in df.columns:
-        ing = int((df["ie_norm"] == "ingreso").sum())
-        egr = int((df["ie_norm"] == "egreso").sum())
-        c2.metric("Ingreso / Egreso", f"{ing} / {egr}")
-    else:
-        c2.metric("Ingreso / Egreso", "—")
-
-    if "pct_ocup" in df.columns:
-        mean_pct = df["pct_ocup"].mean()
-        c3.metric("% ocupación (prom.)", f"{(mean_pct * 100):.1f}%" if pd.notna(mean_pct) else "—")
-    else:
-        c3.metric("% ocupación (prom.)", "—")
-
-    if "Ocupación máxima" in df.columns:
-        med_cap = pd.to_numeric(df["Ocupación máxima"], errors="coerce").median()
-        c4.metric("Capacidad típica (mediana)", f"{med_cap:.0f}" if pd.notna(med_cap) else "—")
-    else:
-        c4.metric("Capacidad típica (mediana)", "—")
-
-
-# =========================
-# Boxplot + cascada + series generales
-# =========================
-def boxplot_section_events(df: pd.DataFrame):
-    st.subheader("Caja y bigotes — por mes / día semana (con filtros locales)")
-
-    if df.empty:
-        st.info("No hay datos.")
-        return
-
-    left, _ = st.columns([1, 3])
-    with left:
-        group = st.radio("Agrupar por", ["Mes", "Día de la semana"], horizontal=False, key="box_group")
-        metric = st.selectbox("Métrica", ["Demanda (correlativos)", "% ocupación"], key="box_metric")
-
-        # ✅ rutas: “una o todas”
-        rutas = sorted([r for r in df["ruta"].dropna().unique().tolist()]) if "ruta" in df.columns else []
-        ruta_choice = st.selectbox("Ruta (local)", ["Todas"] + rutas, index=0, key="box_ruta_one")
-        # jornada: sigue siendo multi (todas por default)
-        jornadas = sorted([j for j in df["jornada"].dropna().unique().tolist()]) if "jornada" in df.columns else []
-        jornadas_sel = st.multiselect("Jornadas (local)", jornadas, default=jornadas, key="box_jornadas")
-
-        dir_sel = st.selectbox("Movimiento (local)", ["Ambos", "Ingreso", "Egreso"], index=0, key="box_dir")
-
-    group_col = "mes_ym" if group == "Mes" else "dia_semana"
-
-    base = df.copy()
-    if ruta_choice != "Todas":
-        base = base[base["ruta"] == ruta_choice]
-    if jornadas_sel:
-        base = base[base["jornada"].isin(jornadas_sel)]
-    if dir_sel != "Ambos" and "ie_norm" in base.columns:
-        base = base[base["ie_norm"] == ("ingreso" if dir_sel == "Ingreso" else "egreso")]
-
-    if base.empty:
-        st.info("No hay datos después del filtro local.")
-        return
-
-    if metric == "% ocupación":
-        if "pct_ocup" not in base.columns:
-            st.info("No existe % ocupación.")
+    def hline(cap, name, dash):
+        if pd.isna(cap):
             return
-        plot_df = base[[group_col, "pct_ocup"]].dropna().copy()
-        plot_df["valor"] = plot_df["pct_ocup"] * 100.0
-        fig = px.box(plot_df, x=group_col, y="valor", points="outliers",
-                     title=f"% ocupación por {group} ({dir_sel})")
-        fig.update_layout(xaxis_title=group, yaxis_title="% ocupación")
-        st.plotly_chart(fig, use_container_width=True)
-        return
+        fig.add_trace(go.Scatter(
+            x=X, y=[float(cap)]*len(X),
+            mode="lines", name=name,
+            line=dict(dash=dash),
+            hovertemplate=f"{name}≈%{{y:.0f}}<extra></extra>"
+        ))
+
+    hline(cap0, "Actual", "dash")
+    hline(capt, "Timid", "dot")
+    hline(capa, "Aggressive", "dashdot")
 
-    base["demanda"] = compute_demand(base)
-    plot_df = base[[group_col, "demanda"]].dropna()
-    if plot_df.empty:
-        st.info("No hay demanda (Cantidad de correlativos) para el boxplot.")
-        return
-
-    fig = px.box(plot_df, x=group_col, y="demanda", points="outliers",
-                 title=f"Demanda (correlativos) por {group} ({dir_sel})")
-    fig.update_layout(xaxis_title=group, yaxis_title="Demanda (Cantidad de correlativos)")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-def waterfall_by_group_events(df: pd.DataFrame):
-    st.subheader("Cascada — Total → descomposición por jornada")
-
-    if df.empty or "jornada" not in df.columns:
-        st.info("No hay datos o falta 'jornada'.")
-        return
-
-    left, _ = st.columns([1, 3])
-    with left:
-        group = st.radio("Grupo", ["Mes", "Día de la semana"], horizontal=False, key="wf_group")
-        measure = st.selectbox("Métrica", ["Movimientos (conteo)", "Demanda (suma)"], key="wf_measure")
-        max_groups = st.slider("Máx. gráficos", 1, 30, 8, key="wf_max")
-        dir_sel = st.selectbox("Movimiento (local)", ["Ambos", "Ingreso", "Egreso"], index=0, key="wf_dir")
-
-        jornadas = sorted([j for j in df["jornada"].dropna().unique().tolist()])
-        jornadas_sel = st.multiselect("Jornadas (local)", jornadas, default=jornadas, key="wf_jornadas")
-
-    group_col = "mes_ym" if group == "Mes" else "dia_semana"
-
-    base = df.copy()
-    base = base[base["jornada"].isin(jornadas_sel)]
-    if dir_sel != "Ambos" and "ie_norm" in base.columns:
-        base = base[base["ie_norm"] == ("ingreso" if dir_sel == "Ingreso" else "egreso")]
-
-    if base.empty:
-        st.info("No hay datos para cascada.")
-        return
-
-    if measure == "Movimientos (conteo)":
-        agg = base.groupby([group_col, "jornada"]).size().reset_index(name="valor")
-        total = base.groupby(group_col).size().reset_index(name="total")
-        y_title = "Movimientos"
-    else:
-        base["demanda"] = compute_demand(base)
-        agg = base.groupby([group_col, "jornada"])["demanda"].sum().reset_index(name="valor")
-        total = base.groupby(group_col)["demanda"].sum().reset_index(name="total")
-        y_title = "Demanda (suma)"
-
-    show_groups = total.sort_values("total", ascending=False).head(max_groups)[group_col].tolist()
-
-    cols = st.columns(2)
-    col_i = 0
-    for g in show_groups:
-        g_rows = agg[agg[group_col] == g].sort_values("valor", ascending=False)
-        if g_rows.empty:
-            continue
-
-        labels = g_rows["jornada"].tolist() + ["Total"]
-        values = g_rows["valor"].tolist() + [0]
-        measures = ["relative"] * len(g_rows) + ["total"]
-
-        fig = go.Figure(go.Waterfall(x=labels, y=values, measure=measures))
-        fig.update_layout(title=f"{y_title} – {group}: {g} ({dir_sel})",
-                          xaxis_title="Jornada", yaxis_title=y_title)
-        cols[col_i].plotly_chart(fig, use_container_width=True)
-        col_i = 1 - col_i
-
-
-def time_bin(df: pd.DataFrame, dt_col: str, gran: str) -> pd.Series:
-    t = pd.to_datetime(df[dt_col], errors="coerce")
-    if gran == "Día":
-        return t.dt.to_period("D").dt.to_timestamp()
-    if gran == "Semana":
-        return t.dt.to_period("W").dt.start_time
-    return t.dt.to_period("M").dt.to_timestamp()
-
-
-def timeseries_overview(df: pd.DataFrame):
-    st.subheader("Series de tiempo (sin hora): movimientos + demanda")
-
-    if df.empty:
-        st.info("No hay datos.")
-        return
-
-    left, _ = st.columns([1, 3])
-    with left:
-        gran = st.selectbox("Granularidad", ["Día", "Semana", "Mes"], index=1, key="ts_gran")
-        metric = st.selectbox("Métrica", ["Movimientos", "Demanda (suma)", "Demanda (P95)"], key="ts_metric")
-        split = st.selectbox("Separar por", ["Nada", "Ingreso/Egreso", "Jornada"], key="ts_split")
-
-    base = df.dropna(subset=["inicio_dt"]).copy()
-    base["t"] = time_bin(base, "inicio_dt", gran)
-    base["demanda"] = compute_demand(base)
-
-    color_col = None
-    if split == "Ingreso/Egreso" and "ie_norm" in base.columns:
-        base["ie_label"] = base["ie_norm"].map({"ingreso": "Ingreso", "egreso": "Egreso"}).fillna("Otro")
-        color_col = "ie_label"
-    elif split == "Jornada" and "jornada" in base.columns:
-        color_col = "jornada"
-
-    if metric == "Movimientos":
-        agg = base.groupby(["t", color_col]).size().reset_index(name="valor") if color_col else base.groupby("t").size().reset_index(name="valor")
-        fig = px.line(agg, x="t", y="valor", color=color_col, markers=True)
-        fig.update_layout(xaxis_title="Tiempo", yaxis_title="Movimientos")
-        st.plotly_chart(fig, use_container_width=True)
-        return
-
-    if base["demanda"].isna().all():
-        st.info("No hay demanda (Cantidad de correlativos) para series.")
-        return
-
-    if metric == "Demanda (suma)":
-        agg = base.groupby(["t", color_col])["demanda"].sum().reset_index(name="valor") if color_col else base.groupby("t")["demanda"].sum().reset_index(name="valor")
-        fig = px.line(agg, x="t", y="valor", color=color_col, markers=True)
-        fig.update_layout(xaxis_title="Tiempo", yaxis_title="Demanda (suma)")
-        st.plotly_chart(fig, use_container_width=True)
-        return
-
-    agg = base.groupby(["t", color_col])["demanda"].quantile(0.95).reset_index(name="valor") if color_col else base.groupby("t")["demanda"].quantile(0.95).reset_index(name="valor")
-    fig = px.line(agg, x="t", y="valor", color=color_col, markers=True)
-    fig.update_layout(xaxis_title="Tiempo", yaxis_title="Demanda (P95)")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# =========================
-# ✅ Nivel de servicio (acumulado / ECDF)
-# =========================
-def service_level_section(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame]):
-    st.subheader("Acumulado: nivel de servicio vs capacidad (demanda = correlativos)")
-
-    if events_df.empty:
-        st.info("No hay datos.")
-        return
-
-    left, right = st.columns([1, 2])
-
-    with left:
-        rutas = sorted([r for r in events_df["ruta"].dropna().unique().tolist()]) if "ruta" in events_df.columns else []
-        ruta_choice = st.selectbox("Ruta", ["Todas"] + rutas, index=0, key="svc_ruta")
-
-        dir_sel = st.selectbox("Movimiento", ["Ambos", "Ingreso", "Egreso"], index=0, key="svc_dir")
-
-        unidad = st.selectbox(
-            "Unidad de análisis (para evitar dependencia por hora)",
-            ["Registro", "Día (máximo)", "Día+Turno (máximo)"],
-            index=1,
-            key="svc_unit",
-        )
-
-        levels = st.multiselect(
-            "Porcentajes objetivo (nivel de servicio)",
-            [0.80, 0.85, 0.90, 0.95, 0.97, 0.99],
-            default=[0.90, 0.95],
-            key="svc_levels",
-        )
-
-    base = events_df.copy()
-    if ruta_choice != "Todas":
-        base = base[base["ruta"] == ruta_choice]
-    if dir_sel != "Ambos" and "ie_norm" in base.columns:
-        base = base[base["ie_norm"] == ("ingreso" if dir_sel == "Ingreso" else "egreso")]
-
-    base["demanda"] = compute_demand(base)
-    base = base.dropna(subset=["demanda"])
-
-    if base.empty:
-        st.info("No hay demanda válida (Cantidad de correlativos) después del filtro.")
-        return
-
-    # unidad -> serie de demanda
-    if unidad == "Registro":
-        s = base["demanda"].astype(float)
-    elif unidad == "Día (máximo)":
-        if "fecha" not in base.columns:
-            st.info("No existe columna fecha para agrupar por día.")
-            return
-        s = base.groupby("fecha")["demanda"].max().astype(float)
-    else:  # Día+Turno
-        if "fecha" not in base.columns or "horario de turno" not in base.columns:
-            st.info("No existe fecha/horario de turno para agrupar.")
-            return
-        s = base.groupby(["fecha", "horario de turno"])["demanda"].max().astype(float)
-
-    s = s.dropna()
-    if s.empty:
-        st.info("Serie de demanda vacía.")
-        return
-
-    # referencia de capacidad actual (Dinamo)
-    current_cap = None
-    if dinamo_df is not None and not dinamo_df.empty and ruta_choice != "Todas":
-        m = dinamo_df[dinamo_df["Ruta"].astype(str).str.strip() == ruta_choice]
-        if not m.empty and "Capacidad" in m.columns:
-            try:
-                current_cap = float(pd.to_numeric(m["Capacidad"], errors="coerce").dropna().iloc[0])
-            except Exception:
-                current_cap = None
-
-    # tabla de capacidades recomendadas por nivel de servicio (quantiles)
-    rec_rows = []
-    for p in sorted(levels):
-        cap_need = float(np.ceil(s.quantile(p)))
-        rec_rows.append({"nivel_servicio_objetivo": f"{int(p*100)}%", "capacidad_minima_recomendada": cap_need})
-    rec_df = pd.DataFrame(rec_rows)
-
-    with right:
-        st.markdown(
-            """
-**Interpretación rápida:**
-- El *nivel de servicio* para una capacidad **C** es: **% de veces que demanda ≤ C**.  
-- Entonces, la capacidad mínima para **95%** es el **P95** (percentil 95) de la demanda.
-"""
-        )
-        if not rec_df.empty:
-            st.dataframe(rec_df, use_container_width=True)
-
-        # slider “¿qué pasa si pongo capacidad C?”
-        cmin = int(max(0, np.floor(s.min())))
-        cmax = int(np.ceil(s.max()))
-        cap_test = st.slider("Probar capacidad C", min_value=cmin, max_value=max(cmin + 1, cmax), value=min(max(cmin + 1, cmax), int(np.ceil(s.quantile(0.95)))), step=1)
-
-        achieved = float((s <= cap_test).mean() * 100.0)
-        overflow = int((s > cap_test).sum())
-        st.metric("Nivel de servicio logrado", f"{achieved:.1f}%")
-        st.metric("Casos excedidos", f"{overflow:,}".replace(",", " "))
-
-    # ECDF plot (acumulado)
-    df_ecdf = pd.DataFrame({"demanda": s.values})
-
-    try:
-        fig = px.ecdf(df_ecdf, x="demanda", title=f"ECDF (acumulado) — {ruta_choice} | {dir_sel} | unidad: {unidad}")
-    except Exception:
-        # fallback manual si px.ecdf no está
-        xs = np.sort(df_ecdf["demanda"].to_numpy(dtype=float))
-        ys = np.arange(1, len(xs) + 1) / len(xs)
-        fig = go.Figure(go.Scatter(x=xs, y=ys, mode="lines", name="ECDF"))
-        fig.update_layout(title=f"ECDF (manual) — {ruta_choice}", xaxis_title="Demanda", yaxis_title="Acumulado")
-
-    # líneas verticales: capacidades recomendadas + capacidad actual + cap_test
-    for p in sorted(levels):
-        cap_need = float(np.ceil(s.quantile(p)))
-        fig.add_vline(x=cap_need, line_dash="dot")
-        fig.add_annotation(x=cap_need, y=0.02, text=f"P{int(p*100)}={int(cap_need)}", showarrow=False, yanchor="bottom")
-
-    fig.add_vline(x=cap_test, line_dash="solid")
-    fig.add_annotation(x=cap_test, y=0.98, text=f"C probada={cap_test}", showarrow=False, yanchor="top")
-
-    if current_cap is not None:
-        fig.add_vline(x=current_cap, line_dash="dash")
-        fig.add_annotation(x=current_cap, y=0.90, text=f"Cap. Dinamo={int(current_cap)}", showarrow=False, yanchor="top")
-
-    fig.update_layout(xaxis_title="Capacidad / Demanda (correlativos)", yaxis_title="Acumulado (nivel de servicio)")
-    st.plotly_chart(fig, use_container_width=True)
-
-
-# =========================
-# TAB Dinamo: precio vs km/tiempo/jornada + pilotos (igual que antes)
-# =========================
-def pilot_metrics_from_resumen(events_df: pd.DataFrame, min_share: float, min_total_events: int, bucket_min_events: int) -> pd.DataFrame:
-    if events_df.empty or "ruta" not in events_df.columns or "piloto" not in events_df.columns:
-        return pd.DataFrame(columns=["ruta_norm"])
-
-    df = events_df.copy()
-    df = df.dropna(subset=["ruta", "piloto"])
-    df["ruta_norm"] = df["ruta"].map(norm_text)
-    df["piloto_norm"] = df["piloto"].map(norm_text)
-    df["horario_norm"] = df["horario de turno"].map(norm_text) if "horario de turno" in df.columns else ""
-
-    rp = df.groupby(["ruta_norm", "piloto_norm"]).size().reset_index(name="events")
-    rt = df.groupby("ruta_norm").size().reset_index(name="events_total")
-    rp = rp.merge(rt, on="ruta_norm", how="left")
-    rp["share"] = rp["events"] / rp["events_total"]
-
-    rp["is_significant"] = (rp["share"] >= min_share) & (rp["events"] >= min_total_events)
-
-    agg = rp.groupby("ruta_norm").agg(
-        pilots_total=("piloto_norm", "nunique"),
-        pilots_significant=("is_significant", "sum"),
-        pilot_top_share=("share", "max"),
-    ).reset_index()
-
-    if "fecha" in df.columns:
-        bucket = df.groupby(["ruta_norm", "fecha", "horario_norm", "piloto_norm"]).size().reset_index(name="bucket_events")
-        bucket = bucket[bucket["bucket_events"] >= bucket_min_events].copy()
-
-        bucket = bucket.merge(rp[["ruta_norm", "piloto_norm", "is_significant"]], on=["ruta_norm", "piloto_norm"], how="left")
-        bucket["is_significant"] = bucket["is_significant"].fillna(False)
-
-        b2 = bucket.groupby(["ruta_norm", "fecha", "horario_norm"]).agg(
-            pilots_in_bucket=("piloto_norm", "nunique"),
-            sig_pilots_in_bucket=("is_significant", "sum"),
-        ).reset_index()
-
-        b_route = b2.groupby("ruta_norm").agg(
-            buckets=("pilots_in_bucket", "count"),
-            avg_pilots_per_bucket=("pilots_in_bucket", "mean"),
-            pct_buckets_2plus_pilots=("pilots_in_bucket", lambda s: (s >= 2).mean() * 100.0),
-            pct_buckets_2plus_sig_pilots=("sig_pilots_in_bucket", lambda s: (s >= 2).mean() * 100.0),
-        ).reset_index()
-
-        out = agg.merge(b_route, on="ruta_norm", how="left")
-    else:
-        out = agg.copy()
-        out["buckets"] = np.nan
-        out["avg_pilots_per_bucket"] = np.nan
-        out["pct_buckets_2plus_pilots"] = np.nan
-        out["pct_buckets_2plus_sig_pilots"] = np.nan
-
-    return out
-
-
-def ols_fit(X: np.ndarray, y: np.ndarray) -> Tuple[np.ndarray, float]:
-    beta, residuals, rank, s = np.linalg.lstsq(X, y, rcond=None)
-    yhat = X @ beta
-    ss_res = float(np.sum((y - yhat) ** 2))
-    ss_tot = float(np.sum((y - np.mean(y)) ** 2))
-    r2 = 1.0 - (ss_res / ss_tot) if ss_tot > 0 else np.nan
-    return beta, r2
-
-
-def dinamo_price_tab(events_df: pd.DataFrame, dinamo_df: Optional[pd.DataFrame]):
-    st.subheader("Dinamo: Precio Q (Diario) — correlación + SHAP básico (cascada)")
-
-    if dinamo_df is None or dinamo_df.empty:
-        st.info("No pude cargar la hoja Dinamo (o viene vacía).")
-        return
-
-    # ---------- controles ----------
-    left, right = st.columns([1, 2])
-    with left:
-        join_mode = st.selectbox(
-            "Cómo unir Dinamo ↔ Resumen",
-            ["Ruta", "Ruta + Jornada", "Ruta + Sede", "Ruta + Sede + Jornada"],
-            index=0,
-        )
-        corr_method = st.selectbox("Correlación (solo numéricas)", ["pearson", "spearman"], index=1)
-
-        min_share = st.slider("Piloto significativo: share mínimo", 0.05, 0.50, 0.15, 0.01)
-        min_total_events = st.number_input("Piloto significativo: eventos mínimos en la ruta", min_value=1, value=30, step=1)
-        bucket_min_events = st.number_input("Simultáneo proxy: eventos mínimos por piloto en bucket (día+turno)", min_value=1, value=2, step=1)
-
-        st.caption("SHAP básico: baseline = predicción promedio; aportes = (x - promedio) * coef.")
-
-    # Spearman/Kendall require scipy in pandas. If it is missing, use Pearson.
-    corr_method_effective = corr_method
-    if corr_method_effective in {"spearman", "kendall"}:
-        try:
-            import scipy  # noqa: F401
-        except Exception:
-            corr_method_effective = "pearson"
-            st.warning("No se encontró scipy en el entorno; se usará correlación Pearson.")
-
-    # ---------- métricas desde resumen (por ruta) ----------
-    pm = pilot_metrics_from_resumen(
-        events_df,
-        min_share=float(min_share),
-        min_total_events=int(min_total_events),
-        bucket_min_events=int(bucket_min_events),
-    )
-
-    if not events_df.empty and "ruta_norm" in events_df.columns:
-        d = events_df.copy()
-        d["demanda"] = compute_demand(d)  # demanda = Cantidad de correlativos
-        dem_stats = d.groupby("ruta_norm").agg(
-            demanda_p50=("demanda", lambda s: s.quantile(0.50)),
-            demanda_p90=("demanda", lambda s: s.quantile(0.90)),
-            demanda_p95=("demanda", lambda s: s.quantile(0.95)),
-            demanda_mean=("demanda", "mean"),
-            mov=("demanda", "count"),
-        ).reset_index()
-        pm = pm.merge(dem_stats, on="ruta_norm", how="left")
-
-    # ---------- merge dinamo + resumen ----------
-    din = dinamo_df.copy()
-
-    keys = ["ruta_norm"]
-    if join_mode in {"Ruta + Jornada", "Ruta + Sede + Jornada"}:
-        keys.append("jornada_norm")
-    if join_mode in {"Ruta + Sede", "Ruta + Sede + Jornada"}:
-        keys.append("sede_norm")
-
-    merged = din.merge(pm, on=keys, how="left")
-
-    if "Precio Q (Diario)" not in merged.columns:
-        st.error("En Dinamo no encontré 'Precio Q (Diario)'.")
-        return
-
-    st.info(f"Filas Dinamo: {len(din):,} | Filas unidas: {len(merged):,}")
-
-    with st.expander("Tabla unida Dinamo↔Resumen", expanded=False):
-        st.dataframe(merged, use_container_width=True)
-
-    # ======================================================
-    # 1) Correlación SOLO vs precio (numéricas)
-    # ======================================================
-    st.markdown("## 1) Correlación numérica vs Precio")
-
-    numeric_vars = [c for c in [
-        "Km", "Tiempo (minutos)", "Capacidad", "# Días",
-        "pilots_total", "pilots_significant", "pilot_top_share",
-        "avg_pilots_per_bucket", "pct_buckets_2plus_sig_pilots",
-        "demanda_p95", "demanda_mean",
-    ] if c in merged.columns]
-
-    corr_rows = []
-    base_corr = merged.dropna(subset=["Precio Q (Diario)"]).copy()
-    for v in numeric_vars:
-        tmp = base_corr[[v, "Precio Q (Diario)"]].dropna()
-        if len(tmp) >= 3:
-            corr_val = tmp[v].corr(tmp["Precio Q (Diario)"], method=corr_method_effective)
-            corr_rows.append({"variable": v, f"corr_{corr_method_effective}": float(corr_val), "n": int(len(tmp))})
-
-    if corr_rows:
-        corr_tbl = pd.DataFrame(corr_rows)
-        corr_tbl["abs"] = corr_tbl[f"corr_{corr_method_effective}"].abs()
-        corr_tbl = corr_tbl.sort_values("abs", ascending=False).drop(columns=["abs"])
-        st.dataframe(corr_tbl, use_container_width=True)
-    else:
-        st.info("No hubo suficientes datos para correlaciones numéricas.")
-
-    # ======================================================
-    # 2) Categóricas vs Precio (Tipo de bus + Jornada)
-    # ======================================================
-    st.markdown("## 2) Categóricas vs Precio")
-
-    cat_cols = []
-    if "Jornada" in merged.columns:
-        cat_cols.append("Jornada")
-    if "Tipo de bus" in merged.columns:
-        cat_cols.append("Tipo de bus")
-
-    if cat_cols:
-        cat = st.selectbox("Categoría", cat_cols, index=0, key="price_cat_pick")
-        plot_df = merged.dropna(subset=["Precio Q (Diario)"]).copy()
-        fig = px.box(plot_df, x=cat, y="Precio Q (Diario)", points="outliers", title=f"Precio por {cat}")
-        fig.update_layout(xaxis_title=cat, yaxis_title="Precio Q (Diario)")
-        st.plotly_chart(fig, use_container_width=True)
-
-        stats = plot_df.groupby(cat)["Precio Q (Diario)"].agg(
-            n="count", mean="mean", median="median", std="std", min="min", max="max"
-        ).reset_index().sort_values("mean", ascending=False)
-        st.dataframe(stats, use_container_width=True)
-    else:
-        st.info("No hay Jornada/Tipo de bus en Dinamo para comparar vs precio.")
-
-    st.markdown("## 3) Cascada de influencia en Precio (ΔR² por variable/bloque)")
-
-    model_df = merged.dropna(subset=["Precio Q (Diario)"]).copy()
-    if model_df.empty:
-        st.info("No hay filas con precio para analizar.")
-        return
-
-    # --- selección de variables numéricas
-    numeric_vars = [c for c in [
-        "Km", "Tiempo (minutos)", "Capacidad", "# Días",
-        "pilots_total", "pilots_significant", "pilot_top_share",
-        "avg_pilots_per_bucket", "pct_buckets_2plus_sig_pilots",
-        "demanda_p95", "demanda_mean",
-    ] if c in model_df.columns]
-
-    default_feats = [c for c in ["# Días", "Km", "Tiempo (minutos)", "demanda_p95", "pilots_total"] if c in numeric_vars]
-    feats_sel = st.multiselect("Variables numéricas (para ΔR²)", numeric_vars, default=default_feats, key="r2_feats")
-
-    include_jornada = ("Jornada" in model_df.columns)
-    include_bus = ("Tipo de bus" in model_df.columns)
-
-    order_mode = st.selectbox(
-        "Orden de entrada (afecta ΔR²)",
-        ["Por |correlación| (numéricas primero)", "Manual (como están seleccionadas)"],
-        index=0,
-        key="r2_order"
-    )
-
-    # --- preparar datos: numéricas -> mediana para no botar filas (exploratorio)
-    for c in feats_sel:
-        model_df[c] = pd.to_numeric(model_df[c], errors="coerce")
-        model_df[c] = model_df[c].fillna(model_df[c].median())
-
-    y = model_df["Precio Q (Diario)"].to_numpy(dtype=float)
-
-    # --- construir dummies (bloques)
-    jd = None
-    if include_jornada:
-        j = model_df["Jornada"].astype(str).fillna("")
-        jd = pd.get_dummies(j, prefix="jornada", drop_first=True)
-
-    bd = None
-    if include_bus:
-        b = model_df["Tipo de bus"].astype(str).fillna("")
-        bd = pd.get_dummies(b, prefix="bus", drop_first=True)
-
-    # --- orden: por |correlación| para numéricas
-    feats_ordered = feats_sel[:]
-    if order_mode.startswith("Por |correlación|"):
-        rows = []
-        for c in feats_sel:
-            tmp = model_df[[c, "Precio Q (Diario)"]].dropna()
-            if len(tmp) >= 3:
-                corr_val = tmp[c].corr(tmp["Precio Q (Diario)"], method=corr_method_effective)
-                rows.append((c, abs(float(corr_val)) if pd.notna(corr_val) else 0.0))
-            else:
-                rows.append((c, 0.0))
-        feats_ordered = [c for c, _ in sorted(rows, key=lambda t: t[1], reverse=True)]
-
-    # --- definir “bloques” a entrar
-    blocks = []
-    for c in feats_ordered:
-        blocks.append((c, model_df[c].to_numpy(dtype=float).reshape(-1, 1)))
-
-    # ✅ mostrar nombre ORIGINAL (no "dummies")
-    if include_jornada and jd is not None and jd.shape[1] > 0:
-        blocks.append(("Jornada", jd.to_numpy(dtype=float)))
-
-    if include_bus and bd is not None and bd.shape[1] > 0:
-        blocks.append(("Tipo de bus", bd.to_numpy(dtype=float)))
-
-    # --- función local: calcula R² con intercept + bloques
-    def r2_for(block_mats: list[np.ndarray]) -> float:
-        X_parts = [np.ones((len(model_df), 1))] + block_mats
-        X = np.concatenate(X_parts, axis=1)
-        _, r2 = ols_fit(X, y)
-        return float(r2)
-
-    # --- calcular ΔR² por bloque (nested models / hierarchical)
-    r2_vals = []
-    deltas = []
-    mats_so_far = []
-
-    prev = 0.0  # intercept-only => R² ~ 0
-    for name, mat in blocks:
-        mats_so_far.append(mat)
-        r2_now = r2_for(mats_so_far)
-        delta = r2_now - prev
-        r2_vals.append(r2_now)
-        deltas.append(delta)
-        prev = r2_now
-
-    total_r2 = prev
-
-    # --- tabla resumen
-    out = pd.DataFrame({
-        "bloque": [b[0] for b in blocks],
-        "delta_R2": deltas,
-        "R2_acumulado": r2_vals
-    }).sort_values("delta_R2", key=lambda s: s.abs(), ascending=False)
-
-    st.write(f"R² total del modelo (con todo): **{total_r2:.3f}**")
-    st.dataframe(out, use_container_width=True)
-
-    # --- waterfall
-    labels = ["R² inicial"] + [b[0] for b in blocks] + ["R² total"]
-    values = [0.0] + deltas + [0.0]
-    measures = ["absolute"] + ["relative"] * len(deltas) + ["total"]
-
-    fig = go.Figure(go.Waterfall(x=labels, y=values, measure=measures))
     fig.update_layout(
-        title="Cascada (ΔR²): cuánto aporta cada variable/bloque a explicar el Precio",
-        xaxis_title="Variable / Bloque",
-        yaxis_title="ΔR² (incremento en varianza explicada)"
+        title=f"Boxplot mensual — {ruta} | {turno} (meses con n≥{min_n_mes})",
+        xaxis_title="Mes",
+        yaxis_title="Pasajeros",
+        xaxis=dict(type="category", categoryorder="array", categoryarray=X),
+        legend=dict(orientation="h", x=0, y=-0.25, xanchor="left", yanchor="top"),
+        margin=dict(t=80, b=90, r=30, l=30)
     )
+    return fig
+
+
+def run_pipeline(df_raw: pd.DataFrame,
+                 months_12m: int,
+                 recent_weeks: int,
+                 backtest_weeks: int,
+                 active_months: int,
+                 min_eval_n: int,
+                 min_group_n: int,
+                 clip_p_eval: float,
+                 clip_p_p90: float,
+                 avail_caps_fixed,
+                 scenarios,
+                 uber_seats: int):
+    d = prepare_df(df_raw)
+    tmax, d12, dR, dBT = build_windows(d, months_12m, recent_weeks, backtest_weeks)
+
+    groups_all = get_groups(d12)
+
+    active_cut = tmax - pd.DateOffset(months=active_months)
+    d_active = d12[d12[DT_COL] >= active_cut]
+    n_active = d_active.groupby(["Ruta", TURN_COL])[PAX_COL].size().reindex(groups_all).fillna(0).astype(int)
+
+    groups = pd.MultiIndex.from_tuples([k for k in groups_all if n_active.loc[k] > 0], names=["Ruta",TURN_COL])
+
+    active_df = pd.DataFrame(list(groups), columns=["Ruta",TURN_COL])
+    d12 = d12.merge(active_df, on=["Ruta",TURN_COL], how="inner")
+    dR  = dR.merge(active_df, on=["Ruta",TURN_COL], how="inner")
+    dBT = dBT.merge(active_df, on=["Ruta",TURN_COL], how="inner")
+
+    avail_caps, cap_actual_all, dias_contract_all = get_avail_caps_and_actual(d12, avail_caps_fixed)
+    cap_actual = cap_actual_all.reindex(groups)
+    dias_contract = dias_contract_all.reindex(groups)
+
+    cap_t = pd.Series(index=groups, dtype="Int64")
+    cap_a = pd.Series(index=groups, dtype="Int64")
+    src_eval = pd.Series(index=groups, dtype="object")
+    n_eval   = pd.Series(index=groups, dtype="int64")
+    cov_eval_t = pd.Series(index=groups, dtype="float64")
+    cov_eval_a = pd.Series(index=groups, dtype="float64")
+    motivo = pd.Series(index=groups, dtype="object")
+
+    for (r,t) in groups:
+        ca = cap_actual.get((r,t), pd.NA)
+        if pd.isna(ca):
+            cap_t.loc[(r,t)] = pd.NA
+            cap_a.loc[(r,t)] = pd.NA
+            motivo.loc[(r,t)] = "Sin cap_actual"
+            continue
+
+        pools = pooled_eval_samples(d12, dR, dBT, r, t)
+        src, arr = pick_eval_pool(pools, min_eval_n, min_group_n)
+        src_eval.loc[(r,t)] = src
+        n_eval.loc[(r,t)] = int(arr.size)
+
+        ct, ca2, tcov, acov, msg = recommend_two_caps_for_group(
+            arr, int(ca), avail_caps, scenarios["timid"], scenarios["aggressive"], src, clip_p_eval
+        )
+        cap_t.loc[(r,t)] = ct
+        cap_a.loc[(r,t)] = ca2
+        cov_eval_t.loc[(r,t)] = tcov
+        cov_eval_a.loc[(r,t)] = acov
+        motivo.loc[(r,t)] = f"{msg} | src={src} n={arr.size}"
+
+    m_act = metrics_for_cap_series(d12, groups, cap_actual)
+    m_t   = metrics_for_cap_series(d12, groups, cap_t)
+    m_a   = metrics_for_cap_series(d12, groups, cap_a)
+
+    reco = pd.DataFrame(index=groups).reset_index()
+    reco["grupo"] = reco.apply(lambda x: _fmt_key(x["Ruta"], x[TURN_COL]), axis=1)
+    reco["n_active_5m"] = n_active.reindex(groups).values
+
+    reco["cap_actual"] = cap_actual.reindex(groups).values
+    reco["cap_reco_timid"] = cap_t.reindex(groups).values
+    reco["cap_reco_aggressive"] = cap_a.reindex(groups).values
+
+    reco["src_eval"] = src_eval.reindex(groups).values
+    reco["n_eval"] = n_eval.reindex(groups).values
+    reco["cov_eval_timid"] = cov_eval_t.reindex(groups).values
+    reco["cov_eval_aggressive"] = cov_eval_a.reindex(groups).values
+    reco["motivo"] = motivo.reindex(groups).values
+
+    # p90 diagnóstico (clipeado)
+    d12[PAX_COL] = pd.to_numeric(d12[PAX_COL], errors="coerce").astype("float64")
+    dR[PAX_COL]  = pd.to_numeric(dR[PAX_COL], errors="coerce").astype("float64")
+
+    d12["pax_clip_p90"] = d12.groupby(["Ruta",TURN_COL])[PAX_COL].transform(lambda s: _winsor_upper_series(s, clip_p_p90))
+    dR["pax_clip_p90"]  = dR.groupby(["Ruta",TURN_COL])[PAX_COL].transform(lambda s: _winsor_upper_series(s, clip_p_p90))
+
+    p90_12m = d12.groupby(["Ruta",TURN_COL])["pax_clip_p90"].quantile(0.90).reindex(groups)
+    p90_recent = dR.groupby(["Ruta",TURN_COL])["pax_clip_p90"].quantile(0.90).reindex(groups)
+    reco["p90_12m_clip"] = p90_12m.values
+    reco["p90_recent_clip"] = p90_recent.values
+
+    reco = reco.merge(m_act.reset_index().rename(columns={
+        "coverage":"coverage_actual","exceed":"exceed_actual","unused_pct":"unused_pct_actual","unused_seats":"unused_seats_actual"
+    }), on=["Ruta",TURN_COL], how="left")
+    reco = reco.merge(m_t.reset_index().rename(columns={
+        "coverage":"coverage_timid","exceed":"exceed_timid","unused_pct":"unused_pct_timid","unused_seats":"unused_seats_timid"
+    }), on=["Ruta",TURN_COL], how="left")
+    reco = reco.merge(m_a.reset_index().rename(columns={
+        "coverage":"coverage_aggressive","exceed":"exceed_aggressive","unused_pct":"unused_pct_aggressive","unused_seats":"unused_seats_aggressive"
+    }), on=["Ruta",TURN_COL], how="left")
+
+    # =========================
+    # AHORRO (RLM Huber) si existe Precio Q (Diario)
+    # =========================
+    if "Precio Q (Diario)" in d12.columns:
+        daily_trips = (
+            d12.assign(fecha=d12[DT_COL].dt.date)
+               .groupby(["Ruta",TURN_COL,"fecha"]).size()
+               .reset_index(name="viajes_dia")
+        )
+        viajes_dia_mean = daily_trips.groupby(["Ruta",TURN_COL])["viajes_dia"].mean().reindex(groups)
+
+        if "Km" in d12.columns:
+            daily_km = (
+                d12.assign(fecha=d12[DT_COL].dt.date)
+                   .groupby(["Ruta",TURN_COL,"fecha"])["Km"].sum()
+                   .reset_index(name="km_dia")
+            )
+            km_dia_mean = daily_km.groupby(["Ruta",TURN_COL])["km_dia"].mean().reindex(groups)
+        else:
+            km_dia_mean = pd.Series(index=groups, dtype="float64")
+
+        precio_por_dia = d12.groupby(["Ruta",TURN_COL])["Precio Q (Diario)"].mean().reindex(groups)
+
+        model_df = pd.DataFrame({
+            "Ruta": [k[0] for k in groups],
+            TURN_COL: [k[1] for k in groups],
+            "precio_por_dia": precio_por_dia.values,
+            "cap_actual": cap_actual.reindex(groups).astype("float64").values,
+            "cap_timid": cap_t.reindex(groups).astype("float64").values,
+            "cap_aggressive": cap_a.reindex(groups).astype("float64").values,
+            "viajes_dia": viajes_dia_mean.values,
+            "km_dia": km_dia_mean.values,
+            "dias_contract": dias_contract.reindex(groups).astype("float64").values,
+        }).dropna(subset=["precio_por_dia","cap_actual"]).copy()
+
+        model_df["log_precio"] = np.log1p(model_df["precio_por_dia"])
+        model_df["log_km_dia"] = np.log1p(pd.to_numeric(model_df["km_dia"], errors="coerce").fillna(0).clip(lower=0))
+        model_df["log_viajes"] = np.log1p(pd.to_numeric(model_df["viajes_dia"], errors="coerce").fillna(0).clip(lower=0))
+        model_df["log_dias"]   = np.log1p(pd.to_numeric(model_df["dias_contract"], errors="coerce").fillna(30).clip(lower=0))
+        model_df["cap"]        = pd.to_numeric(model_df["cap_actual"], errors="coerce")
+
+        for c in ["log_km_dia","log_viajes","log_dias"]:
+            model_df[c] = model_df[c].fillna(model_df[c].median())
+
+        for c in ["log_precio","log_km_dia","log_viajes","log_dias","cap","cap_timid","cap_aggressive"]:
+            model_df[c] = pd.to_numeric(model_df[c], errors="coerce").astype("float64")
+
+        model_df = model_df.replace([np.inf, -np.inf], np.nan).dropna(
+            subset=["log_precio","log_km_dia","log_viajes","log_dias","cap"]
+        ).copy()
+
+        X = sm.add_constant(
+            model_df[["log_km_dia","log_viajes","log_dias","cap"]].astype("float64"),
+            has_constant="add"
+        )
+        y = model_df["log_precio"].astype("float64")
+
+        rlm = sm.RLM(
+            y.to_numpy(dtype="float64"),
+            X.to_numpy(dtype="float64"),
+            M=sm.robust.norms.HuberT()
+        ).fit()
+
+        X_cur = sm.add_constant(
+            model_df[["log_km_dia","log_viajes","log_dias","cap"]].astype("float64"),
+            has_constant="add"
+        ).to_numpy(dtype="float64")
+        model_df["precio_pred_actual"] = np.expm1(rlm.predict(X_cur))
+
+        X_t = sm.add_constant(pd.DataFrame({
+            "log_km_dia": model_df["log_km_dia"],
+            "log_viajes": model_df["log_viajes"],
+            "log_dias": model_df["log_dias"],
+            "cap": model_df["cap_timid"].fillna(model_df["cap"]),
+        }).astype("float64"), has_constant="add").to_numpy(dtype="float64")
+        model_df["precio_pred_timid"] = np.expm1(rlm.predict(X_t))
+
+        X_a2 = sm.add_constant(pd.DataFrame({
+            "log_km_dia": model_df["log_km_dia"],
+            "log_viajes": model_df["log_viajes"],
+            "log_dias": model_df["log_dias"],
+            "cap": model_df["cap_aggressive"].fillna(model_df["cap"]),
+        }).astype("float64"), has_constant="add").to_numpy(dtype="float64")
+        model_df["precio_pred_aggressive"] = np.expm1(rlm.predict(X_a2))
+
+        cut_t = model_df["cap_timid"] < model_df["cap"]
+        cut_a2 = model_df["cap_aggressive"] < model_df["cap"]
+
+        model_df["ahorro_dia_timid"] = 0.0
+        model_df.loc[cut_t, "ahorro_dia_timid"] = (model_df.loc[cut_t, "precio_pred_actual"] - model_df.loc[cut_t, "precio_pred_timid"]).clip(lower=0)
+
+        model_df["ahorro_dia_aggressive"] = 0.0
+        model_df.loc[cut_a2, "ahorro_dia_aggressive"] = (model_df.loc[cut_a2, "precio_pred_actual"] - model_df.loc[cut_a2, "precio_pred_aggressive"]).clip(lower=0)
+
+        model_df["ahorro_mes_timid"] = model_df["ahorro_dia_timid"] * model_df["dias_contract"]
+        model_df["ahorro_mes_aggressive"] = model_df["ahorro_dia_aggressive"] * model_df["dias_contract"]
+
+        reco = reco.merge(
+            model_df[["Ruta",TURN_COL,"precio_por_dia","dias_contract",
+                      "precio_pred_actual","precio_pred_timid","precio_pred_aggressive",
+                      "ahorro_dia_timid","ahorro_mes_timid",
+                      "ahorro_dia_aggressive","ahorro_mes_aggressive"]],
+            on=["Ruta",TURN_COL], how="left"
+        )
+    else:
+        for c in ["precio_por_dia","precio_pred_actual","precio_pred_timid","precio_pred_aggressive",
+                  "ahorro_dia_timid","ahorro_mes_timid","ahorro_dia_aggressive","ahorro_mes_aggressive","dias_contract"]:
+            if c not in reco.columns:
+                reco[c] = np.nan
+
+    reco["ahorro_mes_timid_pos"] = pd.to_numeric(reco.get("ahorro_mes_timid", 0), errors="coerce").fillna(0).clip(lower=0)
+    reco["ahorro_mes_aggressive_pos"] = pd.to_numeric(reco.get("ahorro_mes_aggressive", 0), errors="coerce").fillna(0).clip(lower=0)
+
+    reco = add_excess_costs(reco, d12, uber_seats)
+
+    # tabla resumen cuartiles + coverage %
+    q = (d12.groupby(["Ruta",TURN_COL])[PAX_COL]
+            .quantile([0.25, 0.50, 0.75])
+            .unstack())
+    q.columns = ["q25", "q50", "q75"]
+    n12 = d12.groupby(["Ruta",TURN_COL])[PAX_COL].size().rename("n_12m")
+
+    summary = (reco.merge(q.reset_index(), on=["Ruta",TURN_COL], how="left")
+                  .merge(n12.reset_index(), on=["Ruta",TURN_COL], how="left"))
+
+    for c in ["coverage_actual","coverage_timid","coverage_aggressive"]:
+        summary[c + "_pct"] = (pd.to_numeric(summary[c], errors="coerce") * 100)
+
+    return d12, reco, summary, avail_caps
+
+
+# =========================
+# Streamlit UI
+# =========================
+st.set_page_config(page_title="Rutas — Capacidad vs Demanda", layout="wide")
+
+st.title("Rutas — Capacidad vs Demanda (Timid vs Aggressive)")
+
+with st.sidebar:
+    st.header("Carga de datos")
+    up = st.file_uploader("Subí el CSV limpio (ocupa_clean.csv)", type=["csv"])
+    default_path = st.text_input("O path local", value="ocupa_clean.csv")
+
+    st.divider()
+    st.header("Ventanas")
+    months_12m = st.slider("Meses para 12m (window)", 3, 24, 12, 1)
+    recent_weeks = st.slider("Recent weeks", 1, 26, 8, 1)
+    backtest_weeks = st.slider("Backtest weeks", 1, 26, 4, 1)
+    active_months = st.slider("Filtrar grupos activos últimos (meses)", 1, 12, 5, 1)
+
+    st.divider()
+    st.header("Robustez")
+    clip_p_eval = st.slider("Winsor eval (p)", 0.90, 0.999, 0.995, 0.001)
+    clip_p_p90 = st.slider("Winsor P90 (p)", 0.90, 0.999, 0.99, 0.001)
+    min_eval_n = st.slider("MIN_EVAL_N", 3, 50, 8, 1)
+    min_group_n = st.slider("MIN_GROUP_N", 1, 20, 3, 1)
+
+    st.divider()
+    st.header("Escenarios")
+    timid_cov = st.slider("Timid target_cov", 0.50, 0.99, 0.90, 0.01)
+    timid_slack = st.slider("Timid slack", 0.00, 0.20, 0.02, 0.01)
+    timid_step = st.slider("Timid max_step_drop", 0, 8, 1, 1)
+
+    aggr_cov = st.slider("Aggressive target_cov", 0.50, 0.99, 0.80, 0.01)
+    aggr_slack = st.slider("Aggressive slack", 0.00, 0.30, 0.06, 0.01)
+    aggr_step = st.slider("Aggressive max_step_drop", 0, 12, 3, 1)
+
+    st.divider()
+    st.header("Uber excedentes")
+    uber_seats = st.number_input("Asientos por Uber (para dividir excedente)", min_value=1, max_value=10, value=UBER_SEATS_DEFAULT, step=1)
+
+    st.divider()
+    st.header("Caps disponibles")
+    caps_text = st.text_input("Lista (comma-separated)", value="8,10,12,14,18,20,23,32,34,36,39,42,44,45,46,48")
+    avail_caps_fixed = [int(x.strip()) for x in caps_text.split(",") if x.strip().isdigit()]
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_from_path(path: str) -> pd.DataFrame:
+    return pd.read_csv(path)
+
+
+@st.cache_data(show_spinner=False)
+def load_csv_from_upload(bytes_data) -> pd.DataFrame:
+    return pd.read_csv(bytes_data)
+
+
+# Load data
+if up is not None:
+    df_raw = load_csv_from_upload(up)
+else:
+    try:
+        df_raw = load_csv_from_path(default_path)
+    except Exception as e:
+        st.error(f"No pude leer el archivo. Subilo o revisá el path. Error: {e}")
+        st.stop()
+
+# Normalize minimal
+df_raw = df_raw.copy()
+if DT_COL in df_raw.columns:
+    df_raw[DT_COL] = pd.to_datetime(df_raw[DT_COL], errors="coerce")
+
+scenarios = {
+    "timid": {"target_cov": timid_cov, "slack": timid_slack, "max_step_drop": timid_step},
+    "aggressive": {"target_cov": aggr_cov, "slack": aggr_slack, "max_step_drop": aggr_step},
+}
+
+# Global filters (en el CSV limpio ya no vienen sede/destino/piloto)
+st.subheader("Filtros")
+c1, c2, c3, c4 = st.columns([1.3, 1.3, 1.3, 1.3])
+
+if DT_COL in df_raw.columns and df_raw[DT_COL].notna().any():
+    min_dt = df_raw[DT_COL].min()
+    max_dt = df_raw[DT_COL].max()
+else:
+    min_dt = pd.Timestamp("2024-01-01")
+    max_dt = pd.Timestamp("2026-12-31")
+
+with c1:
+    date_from = st.date_input("Desde", value=min_dt.date())
+with c2:
+    date_to = st.date_input("Hasta", value=max_dt.date())
+
+routes = sorted([x for x in df_raw.get("Ruta", pd.Series([], dtype=str)).dropna().unique().tolist()])
+turns = sorted([x for x in df_raw.get(TURN_COL, pd.Series([], dtype=str)).dropna().unique().tolist()])
+
+with c3:
+    rutas_sel = st.multiselect("Rutas", options=routes, default=routes[:])
+with c4:
+    turnos_sel = st.multiselect("Turnos", options=turns, default=turns[:])
+
+df_f = df_raw.copy()
+if DT_COL in df_f.columns:
+    df_f = df_f[(df_f[DT_COL].dt.date >= date_from) & (df_f[DT_COL].dt.date <= date_to)].copy()
+if "Ruta" in df_f.columns and rutas_sel:
+    df_f = df_f[df_f["Ruta"].isin(rutas_sel)].copy()
+if TURN_COL in df_f.columns and turnos_sel:
+    df_f = df_f[df_f[TURN_COL].isin(turnos_sel)].copy()
+
+# Run pipeline
+with st.spinner("Corriendo análisis…"):
+    d12, reco, summary, avail_caps = run_pipeline(
+        df_f,
+        months_12m=months_12m,
+        recent_weeks=recent_weeks,
+        backtest_weeks=backtest_weeks,
+        active_months=active_months,
+        min_eval_n=min_eval_n,
+        min_group_n=min_group_n,
+        clip_p_eval=clip_p_eval,
+        clip_p_p90=clip_p_p90,
+        avail_caps_fixed=avail_caps_fixed,
+        scenarios=scenarios,
+        uber_seats=int(uber_seats),
+    )
+
+# KPIs
+k1, k2, k3, k4 = st.columns(4)
+k1.metric("Grupos activos", f"{len(reco):,}")
+k2.metric("Ahorro mensual timid (+)", f"Q{reco['ahorro_mes_timid_pos'].sum():,.2f}")
+k3.metric("Ahorro mensual aggressive (+)", f"Q{reco['ahorro_mes_aggressive_pos'].sum():,.2f}")
+k4.metric("Desuso promedio actual", f"{reco['unused_pct_actual'].mean():.2%}" if "unused_pct_actual" in reco.columns else "N/A")
+
+st.caption(f"Caps usados: {avail_caps}")
+
+# Tabs
+tab4, tab1, tab2, tab3 = st.tabs(["Tablas", "Ahorro", "Desuso", "Boxplot & PMF"])
+
+with tab1:
+    st.subheader("Ahorro mensual estimado (solo positivos)")
+    sav = reco[["grupo","ahorro_mes_timid_pos","ahorro_mes_aggressive_pos"]].copy()
+    sav = sav.melt(id_vars=["grupo"], var_name="escenario", value_name="ahorro_mes")
+    sav["escenario"] = sav["escenario"].map({
+        "ahorro_mes_timid_pos":"Timid",
+        "ahorro_mes_aggressive_pos":"Aggressive"
+    })
+    fig = px.bar(
+        sav.sort_values("ahorro_mes", ascending=False),
+        x="grupo", y="ahorro_mes", color="escenario", barmode="group",
+        title="Ahorro mensual estimado — Timid vs Aggressive"
+    )
+    fig.update_layout(xaxis_title="Ruta | Turno", yaxis_title="Ahorro mensual (Q)")
     st.plotly_chart(fig, use_container_width=True)
 
-
-# =========================
-# Main
-# =========================
-def main():
-    st.title("Rutas — Demanda por movimiento y optimización de capacidad")
-
-    with st.sidebar:
-        st.header("Entrada")
-        uploaded = st.file_uploader("Subí el Excel", type=["xlsx", "xls"])
-        sheet_resumen = st.text_input("Hoja resumen", value="resumen")
-        sheet_dinamo = st.text_input("Hoja Dinamo", value="Dinamo")
-        dayfirst = st.checkbox("Interpretar fechas como día/mes (dayfirst)", value=False)
-
-        st.markdown("---")
-        st.subheader("Rutas en común (para corredores)")
-        common_text = st.text_area(
-            "Pegá pares de rutas (una línea por par). Separá con TAB, coma o espacio.",
-            value=DEFAULT_COMMON_ROUTES_TEXT,
-            height=140,
+    if "excess_cost_month_timid" in reco.columns:
+        st.subheader("Costo excedentes (Uber) — mensual")
+        ex = reco[["grupo","excess_cost_month_timid","excess_cost_month_aggressive"]].copy()
+        ex = ex.melt(id_vars=["grupo"], var_name="escenario", value_name="costo_mes")
+        ex["escenario"] = ex["escenario"].map({
+            "excess_cost_month_timid":"Timid",
+            "excess_cost_month_aggressive":"Aggressive"
+        })
+        fig2 = px.bar(
+            ex.sort_values("costo_mes", ascending=False),
+            x="grupo", y="costo_mes", color="escenario", barmode="group",
+            title="Costo mensual excedentes (Uber) — Timid vs Aggressive"
         )
+        fig2.update_layout(xaxis_title="Ruta | Turno", yaxis_title="Costo mensual (Q)")
+        st.plotly_chart(fig2, use_container_width=True)
 
-        st.markdown("---")
-        st.subheader("Diagnóstico Ingreso↔Egreso (NO filtra)")
-        key_mode = st.selectbox(
-            "Heurística bus_key",
-            ["sede+ruta", "sede+ruta+jornada", "sede+ruta+piloto", "sede+ruta+jornada+piloto"],
-            index=1,
-        )
+with tab2:
+    st.subheader("Desuso 12m (% asientos vacíos)")
+    un = reco[["grupo","unused_pct_actual","unused_pct_timid","unused_pct_aggressive"]].copy()
+    un = un.melt(id_vars=["grupo"], var_name="escenario", value_name="unused_pct")
+    un["escenario"] = un["escenario"].map({
+        "unused_pct_actual":"Actual",
+        "unused_pct_timid":"Timid",
+        "unused_pct_aggressive":"Aggressive"
+    })
+    fig = px.bar(un, x="grupo", y="unused_pct", color="escenario", barmode="group",
+                 title="Desuso 12m — Actual vs Timid vs Aggressive")
+    fig.update_layout(xaxis_title="Ruta | Turno", yaxis_tickformat=".0%", yaxis_title="% asientos vacíos")
+    st.plotly_chart(fig, use_container_width=True)
 
-    if not uploaded:
-        st.info("Subí tu archivo Excel para empezar.")
-        return
+with tab3:
+    st.subheader("Boxplot mensual y PMF por grupo (seleccionable)")
 
-    parsed = load_excel_sheets(uploaded.getvalue(), sheet_resumen, sheet_dinamo, dayfirst=dayfirst)
-    events = parsed.resumen
-    dinamo = parsed.dinamo
+    groups_list = reco[["Ruta",TURN_COL,"grupo"]].drop_duplicates().sort_values(["Ruta",TURN_COL])
+    if len(groups_list) == 0:
+        st.info("No hay grupos con data en el rango seleccionado.")
+    else:
+        gsel = st.selectbox("Elegí grupo", options=groups_list["grupo"].tolist(), index=0)
+        row = groups_list[groups_list["grupo"] == gsel].iloc[0]
+        ruta = row["Ruta"]
+        turno = row[TURN_COL]
 
-    edges, edge_warn = parse_edges_from_text(common_text)
-    if not edges:
-        edge_warn.append("No se detectaron pares de rutas en común; todo quedará como SIN_CORREDOR.")
-    events, _ = assign_corridor(events, edges)
+        rec_row = reco[(reco["Ruta"]==ruta) & (reco[TURN_COL]==turno)].iloc[0]
+        cap0 = rec_row.get("cap_actual", np.nan)
+        capt = rec_row.get("cap_reco_timid", np.nan)
+        capa = rec_row.get("cap_reco_aggressive", np.nan)
 
-    all_warn = list(parsed.warnings) + edge_warn
-    if all_warn:
-        with st.expander("⚠️ Avisos", expanded=False):
-            for w in all_warn:
-                st.warning(w)
+        min_n_mes = st.slider("MIN_N_MES (boxplot)", 1, 60, 10, 1)
 
-    pq = pairing_quality(events, key_mode=key_mode)
-    st.info(
-        f"Diagnóstico (solo reporte):\n"
-        f"- Egresos sin ingreso previo (bus_key): {pq['orphan_egreso']}\n"
-        f"- Ingresos consecutivos sin egreso (bus_key): {pq['consecutive_ingreso']}\n"
-        f"- Ingresos abiertos al final (sin egreso): {pq['open_ingreso_end']}"
+        fig_box = build_box_month_figure(d12, ruta, turno, cap0, capt, capa, min_n_mes=min_n_mes)
+        st.plotly_chart(fig_box, use_container_width=True)
+
+        fig_pmf = build_pmf_figure(d12, ruta, turno, cap0, capt, capa)
+        st.plotly_chart(fig_pmf, use_container_width=True)
+
+with tab4:
+    st.subheader("Tabla resumen (cuantiles + coberturas)")
+
+    # ✅ Nuevo: selector de cuantiles
+    q_mode = st.selectbox(
+        "Cuantiles de Pasajeros",
+        [
+            "Cuartiles (25/50/75)",
+            "Quintiles (20/40/60/80)",
+            "Deciles (10..90)"
+        ],
+        index=0
     )
 
-    fs = get_filters(events)
-    events_f = apply_filters_events(events, fs)
+    if q_mode.startswith("Cuartiles"):
+        q_list = [0.25, 0.50, 0.75]
+    elif q_mode.startswith("Quintiles"):
+        q_list = [0.20, 0.40, 0.60, 0.80]
+    else:
+        q_list = [i / 10 for i in range(1, 10)]  # 0.1 ... 0.9
 
-    with st.sidebar:
-        st.markdown("---")
-        st.subheader("Exportar (HTML dinámico)")
+    # ✅ Recalcular cuantiles dinámicos por (Ruta, Turno)
+    q_tbl = (
+        d12.groupby(["Ruta", TURN_COL])[PAX_COL]
+           .quantile(q_list)
+           .unstack()
+    )
 
-        export_scope = st.selectbox(
-            "Qué datos meter en el HTML",
-            ["Todo (permite filtrar después)", "Solo lo filtrado (archivo más liviano)"],
-            index=0
-        )
+    # nombres tipo p25, p50, p75 / p20.. / p10..p90
+    q_cols = [f"p{int(round(q*100))}" for q in q_list]
+    q_tbl.columns = q_cols
 
-        if export_scope.startswith("Todo"):
-            ev_for_html = events
-        else:
-            ev_for_html = events_f
+    # n_12m
+    n12 = d12.groupby(["Ruta", TURN_COL])[PAX_COL].size().rename("n_12m")
 
-        # ✅ date_range a strings ISO (y además json default seguro)
-        date_range_iso = None
-        if fs.date_range and isinstance(fs.date_range, tuple) and len(fs.date_range) == 2:
-            date_range_iso = [_iso_date(fs.date_range[0]), _iso_date(fs.date_range[1])]
+    # ✅ reconstruir summary con cuantiles elegidos
+    summary_dyn = (
+        reco.merge(q_tbl.reset_index(), on=["Ruta", TURN_COL], how="left")
+            .merge(n12.reset_index(), on=["Ruta", TURN_COL], how="left")
+    )
 
-        html_bytes = build_dashboard_html(
-            ev_for_html,
-            dinamo,
-            initial_filters={
-                "date_range": date_range_iso,
-                "corredor_sel": fs.corredor_sel,
-                "sede_sel": fs.sede_sel,
-                "ruta_sel": fs.ruta_sel,
-                "jornada_sel": fs.jornada_sel,
-                "piloto_sel": fs.piloto_sel,
-                "ie_sel": fs.ie_sel,
-            }
-        )
+    # coberturas en %
+    for c in ["coverage_actual", "coverage_timid", "coverage_aggressive"]:
+        if c in summary_dyn.columns:
+            summary_dyn[c + "_pct"] = pd.to_numeric(summary_dyn[c], errors="coerce") * 100
 
-        st.download_button(
-            "Descargar dashboard.html",
-            data=html_bytes,
-            file_name="dashboard.html",
-            mime="text/html"
-        )
+    # Renombres “amenos”
+    to_r = {
+        "n_active_5m": "Pasajeros activos (5m)",
+        "n_12m": "Pasajeros 12m",
+        "cap_actual": "Capacidad actual",
+        "cap_reco_timid": "Capacidad reco. timid",
+        "cap_reco_aggressive": "Capacidad reco. aggressive",
+        "coverage_actual_pct": "Cobertura actual (%)",
+        "coverage_timid_pct": "Cobertura timid (%)",
+        "coverage_aggressive_pct": "Cobertura aggressive (%)",
+        "excess_cost_month_timid": "Costo excedentes mensual (Timid)",
+        "excess_cost_month_aggressive": "Costo excedentes mensual (Aggressive)",
+    }
 
-    tab1, tab2, tab3 = st.tabs(["Dashboard general", "Series / cascada / servicio", "Dinamo: Precio"])
+    # también renombrar cuantiles a algo legible
+    # p25 -> P25, p50 -> P50, etc.
+    q_rename = {c: c.upper() for c in q_cols}
 
-    with tab1:
-        kpi_row_events(events_f)
-        st.markdown("---")
-        boxplot_section_events(events_f)
+    summary_show = summary_dyn.rename(columns={**to_r, **q_rename})
 
-    with tab2:
-        kpi_row_events(events_f)
-        st.markdown("---")
-        waterfall_by_group_events(events_f)
-        st.markdown("---")
-        timeseries_overview(events_f)
-        st.markdown("---")
-        service_level_section(events_f, dinamo)
+    # formateo de coberturas
+    for c in ["Cobertura actual (%)", "Cobertura timid (%)", "Cobertura aggressive (%)"]:
+        if c in summary_show.columns:
+            summary_show[c] = summary_show[c].map(lambda x: f"{x:.2f}%" if pd.notna(x) else "N/A")
 
-        st.markdown("---")
-        st.markdown("### Descargar datos filtrados")
-        csv = events_f.to_csv(index=False).encode("utf-8")
-        st.download_button("Descargar CSV", csv, file_name="eventos_filtrados.csv", mime="text/csv")
+    # columnas a mostrar (dinámicas según cuantiles)
+    q_cols_show = [c.upper() for c in q_cols]
+    cols = [
+        "Ruta", TURN_COL, "grupo",
+        "Pasajeros 12m", "Pasajeros activos (5m)",
+        *q_cols_show,
+        "Capacidad actual", "Capacidad reco. timid", "Capacidad reco. aggressive",
+        "Cobertura actual (%)", "Cobertura timid (%)", "Cobertura aggressive (%)",
+        "Costo excedentes mensual (Timid)", "Costo excedentes mensual (Aggressive)",
+    ]
+    cols = [c for c in cols if c in summary_show.columns]
 
-    with tab3:
-        kpi_row_events(events_f)
-        st.markdown("---")
-        dinamo_price_tab(events_f, dinamo)
+    st.dataframe(
+        summary_show[cols].sort_values(["Ruta", TURN_COL]),
+        use_container_width=True,
+        height=420
+    )
 
+    st.subheader("Tabla detallada (reco)")
+    st.dataframe(
+        reco.sort_values("ahorro_mes_aggressive_pos", ascending=False, na_position="last"),
+        use_container_width=True,
+        height=420
+    )
 
-if __name__ == "__main__":
-    main()
+    # downloads (usá summary_dyn para exportar con cuantiles elegidos)
+    st.download_button(
+        "Descargar summary CSV",
+        data=summary_dyn.to_csv(index=False).encode("utf-8-sig"),
+        file_name="summary.csv",
+        mime="text/csv"
+    )
+    st.download_button(
+        "Descargar reco CSV",
+        data=reco.to_csv(index=False).encode("utf-8-sig"),
+        file_name="reco.csv",
+        mime="text/csv"
+    )
