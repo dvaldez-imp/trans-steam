@@ -5,3 +5,4 @@ plotly>=5.18
 openpyxl>=3.1
 xlrd>=2.0
 scipy>=1.15
+statsmodels>=0.14
