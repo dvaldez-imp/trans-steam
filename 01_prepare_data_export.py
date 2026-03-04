@@ -124,6 +124,7 @@ def main():
     # Hora de inicio viene así: 6/21/24 10:19:59
     # Hay una columna "mes", "dia" y otra "año". Probar esas y si no vienen usar Hora de inicio. Lo mismo para finalización. La idea es tener columnas tipo datetime para poder sacar derivados como fecha, hora, turno, etc.
     df["Momento de inicio"] = df.apply(lambda row: row["Hora de inicio"] if pd.notna(row.get("Hora de inicio", np.nan)) else f"{row.get('mes', '')}/{row.get('dia', '')}/{row.get('año', '')} 00:00:00", axis=1)
+    df["Dia inicio (Dia de la semana)"] = pd.to_datetime(df["Momento de inicio"], errors="coerce").dt.day_name(locale="es_ES")
     df = parse_datetime_col(df, "Hora de finalización", "Momento de finalización")
 
     # derivados (opcionales)
@@ -200,6 +201,7 @@ def main():
         "Fecha al iniciar",
         "Hora de inicio (hora)",
         "Hora de inicio (minuto)",
+        "Dia inicio (Dia de la semana)",
         TURN_COL,
         "Pasajeros",
         # de resumen (si existen)
@@ -221,6 +223,10 @@ def main():
     # Quitar filas sin lo mínimo
     df_out["Momento de inicio"] = pd.to_datetime(df_out["Momento de inicio"], errors="coerce")
     df_out = df_out.dropna(subset=["Ruta", "Momento de inicio", "Pasajeros"], how="any")
+
+    # Por ultimo comparar el numero de Pasajeros con la capacidad y si es mayor, bajarlo a la capacidad (asumiendo que es un error de digitación)
+    if "Capacidad" in df_out.columns:
+        df_out["Pasajeros"] = df_out.apply(lambda row: min(row["Pasajeros"], row["Capacidad"]) if pd.notna(row["Pasajeros"]) and pd.notna(row["Capacidad"]) else row["Pasajeros"], axis=1)
 
     # Export
     df_out.to_csv(out_path, index=False, encoding="utf-8-sig")
